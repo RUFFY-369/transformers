@@ -317,6 +317,7 @@ _import_structure = {
     ],
     "models.deberta_v2": ["DebertaV2Config"],
     "models.decision_transformer": ["DecisionTransformerConfig"],
+    "models.td_mpc2": ["TdMpc2Config"],
     "models.deformable_detr": ["DeformableDetrConfig"],
     "models.deit": ["DeiTConfig"],
     "models.deprecated": [],
@@ -1749,6 +1750,14 @@ else:
             "DecisionTransformerGPT2PreTrainedModel",
             "DecisionTransformerModel",
             "DecisionTransformerPreTrainedModel",
+        ]
+    )
+    _import_structure["models.td_mpc2"].extend(
+        [
+            "TdMpc2GPT2Model",
+            "TdMpc2GPT2PreTrainedModel",
+            "TdMpc2Model",
+            "TdMpc2PreTrainedModel",
         ]
     )
     _import_structure["models.deformable_detr"].extend(
@@ -4886,6 +4895,9 @@ if TYPE_CHECKING:
     from .models.decision_transformer import (
         DecisionTransformerConfig,
     )
+    from .models.td_mpc2 import (
+        TdMpc2Config,
+    )
     from .models.deformable_detr import (
         DeformableDetrConfig,
     )
@@ -6289,6 +6301,12 @@ if TYPE_CHECKING:
             DecisionTransformerGPT2PreTrainedModel,
             DecisionTransformerModel,
             DecisionTransformerPreTrainedModel,
+        )
+        from .models.td_mpc2 import (
+            TdMpc2GPT2Model,
+            TdMpc2GPT2PreTrainedModel,
+            TdMpc2Model,
+            TdMpc2PreTrainedModel,
         )
         from .models.deformable_detr import (
             DeformableDetrForObjectDetection,
