@@ -16,7 +16,9 @@
 
 import copy
 import math
+import numpy as np
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -64,23 +66,6 @@ def zero_(params):
     """Initialize parameters to zero."""
     for p in params:
         p.data.fill_(0)
-
-# Copied from transformers.models.gpt2.modeling_gpt2.GPT2MLP with GPT2->TdMpc2GPT2
-class TdMpc2GPT2MLP(nn.Module):
-    def __init__(self, intermediate_size, config):
-        super().__init__()
-        embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
-        self.act = ACT2FN[config.activation_function]
-        self.dropout = nn.Dropout(config.resid_pdrop)
-
-    def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
 
 
 @dataclass
@@ -232,19 +217,7 @@ class NormedLinear(nn.Module):
         return ACT2FN["swish"](self.ln(x))
 
 
-def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
-    """
-    Basic building block of TD-MPC2.
-    MLP with LayerNorm, Mish activations, and optionally dropout.
-    """
-    if isinstance(mlp_dims, int):
-        mlp_dims = [mlp_dims]
-    dims = [in_dim] + mlp_dims + [out_dim]
-    mlp = nn.ModuleList()
-    for i in range(len(dims) - 2):
-        mlp.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
-    mlp.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
-    return nn.Sequential(*mlp)
+
 
 class ShiftAug(nn.Module):
 	"""
@@ -283,34 +256,50 @@ class PixelPreprocess(nn.Module):
 	def forward(self, x):
 		return x.div_(255.).sub_(0.5)
     
-def conv(in_shape, num_channels, act=None):
-	"""
-	Basic convolutional encoder for TD-MPC2 with raw image observations.
-	4 layers of convolution with ReLU activations, followed by a linear layer.
-	"""
-	assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
-	layers = [
-		ShiftAug(), PixelPreprocess(),
-		nn.Conv2d(in_shape[0], num_channels, 7, stride=2), nn.ReLU(inplace=True),
-		nn.Conv2d(num_channels, num_channels, 5, stride=2), nn.ReLU(inplace=True),
-		nn.Conv2d(num_channels, num_channels, 3, stride=2), nn.ReLU(inplace=True),
-		nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
-	if act:
-		layers.append(act)
-	return nn.Sequential(*layers)
+class TdMpc2LayerModules:
 
-def enc(config, out={}):
-    """
-    Returns a dictionary of encoders for each observation in the dict.
-    """
-    for k in config.obs_shape.keys():
-        if k == 'state':
-            out[k] = mlp(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1)*[config.enc_dim], config.latent_dim, act=SimNorm(config))
-        elif k == 'rgb':
-            out[k] = conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
-        else:
-            raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
-    return nn.ModuleDict(out)
+    def mlp(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
+        """
+        Basic building block of TD-MPC2.
+        MLP with LayerNorm, Mish activations, and optionally dropout.
+        """
+        if isinstance(mlp_dims, int):
+            mlp_dims = [mlp_dims]
+        dims = [in_dim] + mlp_dims + [out_dim]
+        mlp = nn.ModuleList()
+        for i in range(len(dims) - 2):
+            mlp.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
+        mlp.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
+        return nn.Sequential(*mlp)
+    
+    def conv(self, in_shape, num_channels, act=None):
+        """
+        Basic convolutional encoder for TD-MPC2 with raw image observations.
+        4 layers of convolution with ReLU activations, followed by a linear layer.
+        """
+        assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
+        layers = [
+            ShiftAug(), PixelPreprocess(),
+            nn.Conv2d(in_shape[0], num_channels, 7, stride=2), nn.ReLU(inplace=True),
+            nn.Conv2d(num_channels, num_channels, 5, stride=2), nn.ReLU(inplace=True),
+            nn.Conv2d(num_channels, num_channels, 3, stride=2), nn.ReLU(inplace=True),
+            nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
+        if act:
+            layers.append(act)
+        return nn.Sequential(*layers)
+
+    def enc(self, config, out={}):
+        """
+        Returns a dictionary of encoders for each observation in the dict.
+        """
+        for k in config.obs_shape.keys():
+            if k == 'state':
+                out[k] = self.mlp(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1)*[config.enc_dim], config.latent_dim, act=SimNorm(config))
+            elif k == 'rgb':
+                out[k] = self.conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
+            else:
+                raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
+        return nn.ModuleDict(out)
 
 #####################################################################
 class TdMpc2WorldModel(nn.Module):
@@ -322,33 +311,34 @@ class TdMpc2WorldModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        layers = TdMpc2LayerModules()
         if config.multitask:
             self._task_emb = nn.Embedding(len(config.tasks), config.task_dim, max_norm=1)
             self._action_masks = torch.zeros(len(config.tasks), config.action_dim)
             for i in range(len(config.tasks)):
                 self._action_masks[i, :config.action_dims[i]] = 1.
         self._encoder = layers.enc(config)
-        self._dynamics = layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=layers.SimNorm(config))
+        self._dynamics = layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
         self._reward = layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
         self._pi = layers.mlp(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
-        self._Qs = layers.Ensemble([layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
-        self.apply(init.weight_init)
-        init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
+        self._Qs = Ensemble([layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
+        # self.apply(init.weight_init)
+        # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
         self._target_Qs = deepcopy(self._Qs).requires_grad_(False)
         self.log_std_min = torch.tensor(config.log_std_min)
         self.log_std_dif = torch.tensor(config.log_std_max) - self.log_std_min
 
         
-    def to(self, *args, **kwargs):
-        """
-        Overriding `to` method to also move additional tensors to device.
-        """
-        super().to(*args, **kwargs)
-        if self.config.multitask:
-            self._action_masks = self._action_masks.to(*args, **kwargs)
-        self.log_std_min = self.log_std_min.to(*args, **kwargs)
-        self.log_std_dif = self.log_std_dif.to(*args, **kwargs)
-        return self
+    # def to(self, *args, **kwargs):
+    #     """
+    #     Overriding `to` method to also move additional tensors to device.
+    #     """
+    #     super().to(*args, **kwargs)
+    #     if self.config.multitask:
+    #         self._action_masks = self._action_masks.to(*args, **kwargs)
+    #     self.log_std_min = self.log_std_min.to(*args, **kwargs)
+    #     self.log_std_dif = self.log_std_dif.to(*args, **kwargs)
+    #     return self
 
     def track_q_grad(self, mode=True):
         """
@@ -466,57 +456,31 @@ class TdMpc2WorldModel(nn.Module):
         Q1, Q2 = math.two_hot_inv(Q1, self.config), math.two_hot_inv(Q2, self.config)
         return torch.min(Q1, Q2) if return_type == 'min' else (Q1 + Q2) / 2
 
-def action_pred(self, zs, tasks):
-        """
-        Update policy using a sequence of latent states.
+
+class TdMpc2Losses():
+
+    def compute_total_losses(self,config,rewards,z,next_z,reward_preds,td_targets,qs):
         
-        Args:
-            zs (torch.Tensor): Sequence of latent states.
-            task (torch.Tensor): Task index (only used for multi-task experiments).
-
-        Returns:
-            float: Loss of the policy update.
-        """
-
-        self.world_model.track_q_grad(False)
-        action_pred, _,_,_ = self.world_model.pi(zs, tasks)
-    
-
-
-class TdMpc2Losses(batch,zs,world_model):
-    def compute_total_losses(self):
         consistency_loss = 0
-        for t in range(self.config.horizon):
-            z = self.world_model.next(z, actions[t], tasks)
-            consistency_loss += F.mse_loss(z, next_z[t]) * self.config.rho**t
-            zs[t+1] = z
+        for t in range(config.horizon):
+            consistency_loss += F.mse_loss(z[t], next_z[t]) * config.rho**t
 
-        # Predictions
-        _zs = zs[:-1]
-        qs = self.world_model.Q(_zs, actions, tasks, return_type='all')
-        reward_preds = self.world_model.reward(_zs, actions, tasks)
-
-        #REWARDS PRED HF
-        print("reward_preds:",reward_preds)
-        
-        # Compute losses
         reward_loss, value_loss = 0, 0
-        for t in range(self.config.horizon):
-            reward_loss += math.soft_ce(reward_preds[t], reward[t], self.config).mean() * self.config.rho**t
-            for q in range(self.config.num_q):
-                value_loss += math.soft_ce(qs[q][t], td_targets[t], self.config).mean() * self.config.rho**t
-        consistency_loss *= (1/self.config.horizon)
-        reward_loss *= (1/self.config.horizon)
-        value_loss *= (1/(self.config.horizon * self.config.num_q))
+        for t in range(config.horizon):
+            reward_loss += math.soft_ce(reward_preds[t], rewards[t],config).mean() * config.rho**t
+            for q in range(config.num_q):
+                value_loss += math.soft_ce(qs[q][t], td_targets[t], config).mean() * config.rho**t
+        consistency_loss *= (1/config.horizon)
+        reward_loss *= (1/config.horizon)
+        value_loss *= (1/(config.horizon * config.num_q))
         total_loss = (
-            self.config.consistency_coef * consistency_loss +
-            self.config.reward_coef * reward_loss +
-            self.config.value_coef * value_loss
+            config.consistency_coef * consistency_loss +
+            config.reward_coef * reward_loss +
+            config.value_coef * value_loss
         )
         return total_loss 
 
 @add_start_docstrings("The TD-MPC2 Model", DECISION_TRANSFORMER_START_DOCSTRING)
-# Copied from transformers.models.decision_transformer.modeling_decision_transformer.DecisionTransformerModel with DecisionTransformer->TdMpc2,edbeeching/decision-transformer-gym-hopper-medium->ruffy369/tdmpc2-dog-run
 class TdMpc2Model(TdMpc2PreTrainedModel):
     """
 
@@ -529,28 +493,9 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.world_model = TdMpc2WorldModel()
-        self.discount = torch.tensor(
-            [self._get_discount(ep_len) for ep_len in config.episode_lengths], device='cuda'
-        ) if self.config.multitask else self._get_discount(config.episode_length)
 
         # Initialize weights and apply final processing
         self.post_init()
-    
-    def _td_target(self, next_z, reward, tasks):
-        """
-        Compute the TD-target from a reward and the observation at the following time step.
-        
-        Args:
-            next_z (torch.Tensor): Latent state at the following time step.
-            reward (torch.Tensor): Reward at the current time step.
-            tasks (torch.Tensor): Task index (only used for multi-task experiments).
-        
-        Returns:
-            torch.Tensor: TD-target.
-        """
-        pi = self.world_model.pi(next_z, tasks)[1]
-        discount = self.discount[tasks].unsqueeze(-1) if self.config.multitask else self.discount
-        return reward + discount * self.world_model.Q(next_z, pi, tasks, return_type='min', target=True)
 
     def _get_discount(self, episode_length):
             """
@@ -566,6 +511,28 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             """
             frac = episode_length/self.config.discount_denom
             return min(max((frac-1)/(frac), self.config.discount_min), self.config.discount_max)
+    
+    def _td_target(self, next_z, reward, tasks):
+        """
+        Compute the TD-target from a reward and the observation at the following time step.
+        
+        Args:
+            next_z (torch.Tensor): Latent state at the following time step.
+            reward (torch.Tensor): Reward at the current time step.
+            tasks (torch.Tensor): Task index (only used for multi-task experiments).
+        
+        Returns:
+            torch.Tensor: TD-target.
+        """
+        pi = self.world_model.pi(next_z, tasks)[1]
+
+        discount = torch.tensor(
+            [self._get_discount(ep_len) for ep_len in self.config.episode_lengths], device='cuda'
+        ) if self.config.multitask else self._get_discount(self.config.episode_length)
+
+        discount = discount[tasks].unsqueeze(-1) if self.config.multitask else discount
+        
+        return reward + discount * self.world_model.Q(next_z, pi, tasks, return_type='min', target=True)
 
     @add_start_docstrings_to_model_forward(DECISION_TRANSFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=TdMpc2Output, config_class=_CONFIG_FOR_DOC)
@@ -631,13 +598,14 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             next_z = self.world_model.encode(observations[1:], tasks)
             td_targets = self._td_target(next_z, rewards, tasks)
         
+        losses_td_mpc2 = TdMpc2Losses()
         zs = torch.empty(self.config.horizon+1, self.config.batch_size, self.config.latent_dim, device=self.device)
         z = self.world_model.encode(observations[0], tasks)
         zs[0] = z
-        consistency_loss = 0
+        z_copy = zs.clone()
+
         for t in range(self.config.horizon):
             z = self.world_model.next(z, actions[t], tasks)
-            consistency_loss += F.mse_loss(z, next_z[t]) * self.config.rho**t
             zs[t+1] = z
 
         # Predictions
@@ -645,17 +613,16 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         qs = self.world_model.Q(_zs, actions, tasks, return_type='all')
         reward_preds = self.world_model.reward(_zs, actions, tasks)
 
-        action_pred = self.action_pred(zs.detach(), tasks)
+        self.world_model.track_q_grad(False)
+        action_pred, _,_,_ = self.world_model.pi(zs.detach(), tasks)
 
-        # get predictions
-        # return_preds = self.predict_return(x[:, 2])  # predict next return given state and actions
-        # state_preds = self.predict_state(x[:, 2])  # predict next state given state and actions
-        # action_preds = self.predict_action(x[:, 1])  # predict next actions given state
+        total_loss = losses_td_mpc2.compute_total_losses(self.config,rewards,z_copy,next_z,reward_preds,td_targets,qs)
+
         if not return_dict:
             return tuple(
                 v
                 for v in [
-                    None,
+                    total_loss,
                     None,
                     None,
                     None,
@@ -666,7 +633,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             )
 
         return TdMpc2Output(
-            losses=None,
+            losses=total_loss,
             action_preds=action_pred,
             reward_preds=reward_preds,
             return_preds=td_targets,
