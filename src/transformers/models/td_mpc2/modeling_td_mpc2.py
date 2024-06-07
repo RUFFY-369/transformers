@@ -161,7 +161,6 @@ DECISION_TRANSFORMER_INPUTS_DOCSTRING = r"""
             Masking, used to mask the actions when performing autoregressive prediction
 """
 
-#LAYERSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
 class Ensemble(nn.Module):
     """
     Vectorized ensemble of modules.
@@ -216,9 +215,6 @@ class NormedLinear(nn.Module):
             x = self.dropout(x)
         return ACT2FN["swish"](self.ln(x))
 
-
-
-
 class ShiftAug(nn.Module):
 	"""
 	Random shift image augmentation.
@@ -255,53 +251,79 @@ class PixelPreprocess(nn.Module):
 
 	def forward(self, x):
 		return x.div_(255.).sub_(0.5)
-    
-class TdMpc2LayerModules:
 
-    def mlp(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
-        """
-        Basic building block of TD-MPC2.
-        MLP with LayerNorm, Mish activations, and optionally dropout.
-        """
+class MLP(nn.Module):
+    """
+    Basic building block of TD-MPC2.
+    MLP with LayerNorm, Mish activations, and optionally dropout.
+    """
+    def __init__(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
+        super().__init__()
         if isinstance(mlp_dims, int):
             mlp_dims = [mlp_dims]
         dims = [in_dim] + mlp_dims + [out_dim]
-        mlp = nn.ModuleList()
+        
+        self.mlp_layers = nn.ModuleList()
         for i in range(len(dims) - 2):
-            mlp.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
-        mlp.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
-        return nn.Sequential(*mlp)
+            self.mlp_layers.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
+        self.mlp_layers.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
+        # return nn.Sequential(*self.mlp_layers)
+        
+    def forward(self, x,output_hidden_states: bool = False):
+        self.hidden_states = () if output_hidden_states else None
+        for mlp_layer in self.mlp_layers:
+            x = mlp_layer(x)
+            self.hidden_states = self.hidden_states + (x,) if output_hidden_states else None
+        return x
     
-    def conv(self, in_shape, num_channels, act=None):
-        """
-        Basic convolutional encoder for TD-MPC2 with raw image observations.
-        4 layers of convolution with ReLU activations, followed by a linear layer.
-        """
+    def get_hidden_states(self):
+        return self.hidden_states
+
+class conv(nn.Module):
+    """
+    Basic convolutional encoder for TD-MPC2 with raw image observations.
+    4 layers of convolution with ReLU activations, followed by a linear layer.
+    """
+    def __init__(self, in_shape, num_channels, act=None):
+        super().__init__()
         assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
-        layers = [
+        
+        conv_layers = [
             ShiftAug(), PixelPreprocess(),
             nn.Conv2d(in_shape[0], num_channels, 7, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 5, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 3, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
         if act:
-            layers.append(act)
-        return nn.Sequential(*layers)
+            conv_layers.append(act)
+        self.conv_layers = nn.ModuleList(conv_layers)
+        # return nn.Sequential(*layers)
+        
+    def forward(self, x):
+        self.hidden_states = []  # Initialize hidden states here to reset on each forward pass
+        for conv_layer in self.conv_layers:
+            x = conv_layer(x)
+            self.hidden_states.append(x)
+        return x
+    
+    def get_hidden_states(self):
+        return self.hidden_states
 
+class EncodersDict():
+    """
+    Returns a dictionary of encoders for each observation in the dict.
+    """
     def enc(self, config, out={}):
-        """
-        Returns a dictionary of encoders for each observation in the dict.
-        """
+        self.out = out
         for k in config.obs_shape.keys():
             if k == 'state':
-                out[k] = self.mlp(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1)*[config.enc_dim], config.latent_dim, act=SimNorm(config))
+                self.out[k] = MLP(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1) * [config.enc_dim], config.latent_dim, act=SimNorm(config))
             elif k == 'rgb':
-                out[k] = self.conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
+                self.out[k] = conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
             else:
                 raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
-        return nn.ModuleDict(out)
+        return nn.ModuleDict(self.out)
 
-#####################################################################
 class TdMpc2WorldModel(nn.Module):
     """
     TD-MPC2 implicit world model architecture.
@@ -311,34 +333,22 @@ class TdMpc2WorldModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        layers = TdMpc2LayerModules()
+        enc_layers = EncodersDict()
         if config.multitask:
             self._task_emb = nn.Embedding(len(config.tasks), config.task_dim, max_norm=1)
             self._action_masks = torch.zeros(len(config.tasks), config.action_dim)
             for i in range(len(config.tasks)):
                 self._action_masks[i, :config.action_dims[i]] = 1.
-        self._encoder = layers.enc(config)
-        self._dynamics = layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
-        self._reward = layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
-        self._pi = layers.mlp(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
-        self._Qs = Ensemble([layers.mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
+        self._encoder = enc_layers.enc(config)
+        self._dynamics = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
+        self._reward = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
+        self._pi = MLP(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
+        self._Qs = Ensemble([MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
         # self.apply(init.weight_init)
         # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
         self._target_Qs = deepcopy(self._Qs).requires_grad_(False)
         self.log_std_min = torch.tensor(config.log_std_min)
         self.log_std_dif = torch.tensor(config.log_std_max) - self.log_std_min
-
-        
-    # def to(self, *args, **kwargs):
-    #     """
-    #     Overriding `to` method to also move additional tensors to device.
-    #     """
-    #     super().to(*args, **kwargs)
-    #     if self.config.multitask:
-    #         self._action_masks = self._action_masks.to(*args, **kwargs)
-    #     self.log_std_min = self.log_std_min.to(*args, **kwargs)
-    #     self.log_std_dif = self.log_std_dif.to(*args, **kwargs)
-    #     return self
 
     def track_q_grad(self, mode=True):
         """
@@ -623,9 +633,9 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
                 v
                 for v in [
                     total_loss,
-                    None,
-                    None,
-                    None,
+                    action_pred,
+                    reward_preds,
+                    td_targets,
                     None,
                     None,
                 ]
