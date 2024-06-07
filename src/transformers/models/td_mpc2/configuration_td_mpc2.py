@@ -96,58 +96,102 @@ class TdMpc2Config(PretrainedConfig):
     model_type = "td_mpc2"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
-        "max_position_embeddings": "n_positions",
-        "num_attention_heads": "n_head",
+        "hidden_size": "embed_dim_world_model",
         "num_hidden_layers": "n_layer",
     }
 
     def __init__(
         self,
-        state_dim=17,
-        act_dim=4,
-        hidden_size=128,
-        max_ep_len=4096,
-        action_tanh=True,
-        vocab_size=1,
-        n_positions=1024,
-        n_layer=3,
-        n_head=1,
-        n_inner=None,
-        activation_function="relu",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        scale_attn_weights=True,
+        task= "dog-run",
+        obs= "state",
+        batch_size= 256,
+        reward_coef= 0.1,
+        value_coef= 0.1,
+        consistency_coef= 20,
+        rho= 0.5,
+        lr= 3e-4,
+        enc_lr_scale= 0.3,
+        grad_clip_norm= 20,
+        tau= 0.01,
+        discount_denom= 5,
+        discount_min= 0.95,
+        discount_max= 0.995,
+        buffer_size= 1_000_000,
+        horizon= 3,
+        log_std_min= -10,
+        log_std_max= 2,
+        entropy_coef= 1e-4,
+        num_bins= 101,
+        vmin= -10,
+        vmax= +10,
+        # model_size= 1,
+        num_enc_layers= 2,
+        enc_dim= 256,
+        num_channels= 32,
+        mlp_dim= 512,
+        latent_dim= 512,
+        task_dim= 96,
+        num_q= 5,
+        dropout= 0.01,
+        simnorm_dim= 8,
+        multitask= False,
+        tasks= ["dog-run"],
+        obs_shape= {'state': [223]},
+        action_dim= 38,
+        episode_length= 500,
+        obs_shapes= None,
+        action_dims= None,
+        episode_lengths= None,
+
         use_cache=True,
+        pad_token_id=1,
         bos_token_id=50256,
         eos_token_id=50256,
-        scale_attn_by_inverse_layer_idx=False,
-        reorder_and_upcast_attn=False,
         **kwargs,
     ):
-        self.state_dim = state_dim
-        self.act_dim = act_dim
-        self.hidden_size = hidden_size
-        self.max_ep_len = max_ep_len
-        self.action_tanh = action_tanh
-        self.vocab_size = vocab_size
-        self.n_positions = n_positions
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_inner = n_inner
-        self.activation_function = activation_function
-        self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.attn_pdrop = attn_pdrop
-        self.layer_norm_epsilon = layer_norm_epsilon
-        self.initializer_range = initializer_range
-        self.scale_attn_weights = scale_attn_weights
-        self.use_cache = use_cache
-        self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
-        self.reorder_and_upcast_attn = reorder_and_upcast_attn
+        self.task= task
+        self.obs= obs
+        self.batch_size= batch_size
+        self.reward_coef= reward_coef
+        self.value_coef= value_coef
+        self.consistency_coef= consistency_coef
+        self.rho= rho
+        self.lr= lr
+        self.enc_lr_scale= enc_lr_scale
+        self.grad_clip_norm= grad_clip_norm
+        self.tau= tau
+        self.discount_denom= discount_denom
+        self.discount_min= discount_min
+        self.discount_max= discount_max
+        self.buffer_size= buffer_size
+        self.horizon= horizon
+        self.log_std_min= log_std_min
+        self.log_std_max= log_std_max
+        self.entropy_coef= entropy_coef
+        self.num_bins= num_bins
+        self.vmin= vmin
+        self.vmax= vmax
+        self.num_enc_layers= num_enc_layers
+        self.enc_dim= enc_dim
+        self.num_channels= num_channels
+        self.mlp_dim= mlp_dim
+        self.latent_dim= latent_dim
+        self.task_dim= task_dim
+        self.num_q= num_q
+        self.dropout= dropout
+        self.simnorm_dim= simnorm_dim
+        self.multitask= multitask
+        self.tasks= tasks
+        self.obs_shape= obs_shape
+        self.action_dim= action_dim
+        self.episode_length= episode_length
+        self.obs_shapes= obs_shapes
+        self.action_dims= action_dims
+        self.episode_lengths= episode_lengths
+        self.bin_size= (self.vmax - self.vmin) / (self.num_bins-1),
 
+        self.use_cache = use_cache
+        self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
