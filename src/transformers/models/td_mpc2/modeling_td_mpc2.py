@@ -193,41 +193,41 @@ class NormedLinear(nn.Module):
         return self.act(self.ln(x))
 
 class ShiftAug(nn.Module):
-	"""
-	Random shift image augmentation.
-	Adapted from https://github.com/facebookresearch/drqv2
-	"""
-	def __init__(self, pad=3):
-		super().__init__()
-		self.pad = pad
+    """
+    Random shift image augmentation.
+    Adapted from https://github.com/facebookresearch/drqv2
+    """
+    def __init__(self, pad=3):
+        super().__init__()
+        self.pad = pad
 
-	def forward(self, x):
-		x = x.float()
-		n, _, h, w = x.size()
-		assert h == w
-		padding = tuple([self.pad] * 4)
-		x = F.pad(x, padding, 'replicate')
-		eps = 1.0 / (h + 2 * self.pad)
-		arange = torch.linspace(-1.0 + eps, 1.0 - eps, h + 2 * self.pad, device=x.device, dtype=x.dtype)[:h]
-		arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
-		base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
-		base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
-		shift = torch.randint(0, 2 * self.pad + 1, size=(n, 1, 1, 2), device=x.device, dtype=x.dtype)
-		shift *= 2.0 / (h + 2 * self.pad)
-		grid = base_grid + shift
-		return F.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
+    def forward(self, x):
+        x = x.float()
+        n, _, h, w = x.size()
+        assert h == w
+        padding = tuple([self.pad] * 4)
+        x = F.pad(x, padding, 'replicate')
+        eps = 1.0 / (h + 2 * self.pad)
+        arange = torch.linspace(-1.0 + eps, 1.0 - eps, h + 2 * self.pad, device=x.device, dtype=x.dtype)[:h]
+        arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
+        base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
+        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
+        shift = torch.randint(0, 2 * self.pad + 1, size=(n, 1, 1, 2), device=x.device, dtype=x.dtype)
+        shift *= 2.0 / (h + 2 * self.pad)
+        grid = base_grid + shift
+        return F.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
 
 
 class PixelPreprocess(nn.Module):
-	"""
-	Normalizes pixel observations to [-0.5, 0.5].
-	"""
+    """
+    Normalizes pixel observations to [-0.5, 0.5].
+    """
 
-	def __init__(self):
-		super().__init__()
+    def __init__(self):
+        super().__init__()
 
-	def forward(self, x):
-		return x.div_(255.).sub_(0.5)
+    def forward(self, x):
+        return x.div_(255.).sub_(0.5)
 
 class MLP():
     """
@@ -295,6 +295,52 @@ class EncodersDict():
             else:
                 raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
         return nn.ModuleDict(self.out)
+
+class RunningScale:
+    """Running trimmed scale estimator."""
+
+    def __init__(self, config):
+        self.config = config
+        self._value = torch.ones(1, dtype=torch.float32, device=torch.device('cuda'))
+        self._percentiles = torch.tensor([5, 95], dtype=torch.float32, device=torch.device('cuda'))
+
+    def state_dict(self):
+        return dict(value=self._value, percentiles=self._percentiles)
+
+    def load_state_dict(self, state_dict):
+        self._value.data.copy_(state_dict['value'])
+        self._percentiles.data.copy_(state_dict['percentiles'])
+
+    @property
+    def value(self):
+        return self._value.cpu().item()
+
+    def _percentile(self, x):
+        x_dtype, x_shape = x.dtype, x.shape
+        x = x.view(x.shape[0], -1)
+        in_sorted, _ = torch.sort(x, dim=0)
+        positions = self._percentiles * (x.shape[0]-1) / 100
+        floored = torch.floor(positions)
+        ceiled = floored + 1
+        ceiled[ceiled > x.shape[0] - 1] = x.shape[0] - 1
+        weight_ceiled = positions-floored
+        weight_floored = 1.0 - weight_ceiled
+        d0 = in_sorted[floored.long(), :] * weight_floored[:, None]
+        d1 = in_sorted[ceiled.long(), :] * weight_ceiled[:, None]
+        return (d0+d1).view(-1, *x_shape[1:]).type(x_dtype)
+
+    def update(self, x):
+        percentiles = self._percentile(x.detach())
+        value = torch.clamp(percentiles[1] - percentiles[0], min=1.)
+        self._value.data.lerp_(value, self.config.tau)
+
+    def __call__(self, x, update=False):
+        if update:
+            self.update(x)
+        return x * (1/self.value)
+
+    def __repr__(self):
+        return f'RunningScale(S: {self.value})'
 
 class TdMpc2WorldModel(nn.Module):
     """
@@ -475,6 +521,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.world_model = TdMpc2WorldModel(config)
+        self.scale = RunningScale(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -515,6 +562,31 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         discount = discount[tasks].unsqueeze(-1) if self.config.multitask else discount
         
         return reward + discount * self.world_model.Q(next_z, pi, tasks, return_type='min', target=True)
+    
+    def update_pi(self, zs, task):
+        """
+        Update policy using a sequence of latent states.
+
+        Args:
+            zs (torch.Tensor): Sequence of latent states.
+            task (torch.Tensor): Task index (only used for multi-task experiments).
+
+        Returns:
+            float: Loss of the policy update.
+        """
+        self.world_model.track_q_grad(False)
+        _, pis, log_pis, _ = self.world_model.pi(zs, task)
+        qs = self.world_model.Q(zs, pis, task, return_type='avg')
+        self.scale.update(qs[0])
+        qs = self.scale(qs)
+
+        # Loss is a weighted sum of Q-values
+        rho = torch.pow(self.config.rho, torch.arange(len(qs), device=self.device))
+        pi_loss = ((self.config.entropy_coef * log_pis - qs).mean(dim=(1,2)) * rho).mean()
+        torch.nn.utils.clip_grad_norm_(self.world_model._pi.parameters(), self.config.grad_clip_norm)
+        self.world_model.track_q_grad(True)
+
+        return pi_loss.item()
 
     @add_start_docstrings_to_model_forward(DECISION_TRANSFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=TdMpc2Output, config_class=_CONFIG_FOR_DOC)
@@ -599,12 +671,14 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         action_pred, _,_,_ = self.world_model.pi(zs.detach(), tasks)
 
         total_loss = losses_td_mpc2.compute_total_losses(self.config,rewards,z_copy,next_z,reward_preds,td_targets,qs)
+        pi_loss = self.update_pi(zs.detach(), tasks)
+        total_model_loss = (total_loss,pi_loss)
 
         if not return_dict:
             return tuple(
                 v
                 for v in [
-                    total_loss,
+                    total_model_loss,
                     action_pred,
                     reward_preds,
                     td_targets,
@@ -615,7 +689,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             )
 
         return TdMpc2Output(
-            losses=total_loss,
+            losses=total_model_loss,
             action_preds=action_pred,
             reward_preds=reward_preds,
             return_preds=td_targets,
