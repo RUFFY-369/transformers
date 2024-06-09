@@ -46,28 +46,6 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "ruffy369/tdmpc2-dog-run"
 _CONFIG_FOR_DOC = "TdMpc2Config"
 
-
-def weight_init(m):
-    """Custom weight initialization for TD-MPC2."""
-    if isinstance(m, nn.Linear):
-        nn.init.trunc_normal_(m.weight, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Embedding):
-        nn.init.uniform_(m.weight, -0.02, 0.02)
-    elif isinstance(m, nn.ParameterList):
-        for i,p in enumerate(m):
-            if p.dim() == 3: # Linear
-                nn.init.trunc_normal_(p, std=0.02) # Weight
-                nn.init.constant_(m[i+1], 0) # Bias
-
-
-def zero_(params):
-    """Initialize parameters to zero."""
-    for p in params:
-        p.data.fill_(0)
-
-
 @dataclass
 # Copied from transformers.models.decision_transformer.modeling_decision_transformer.DecisionTransformerOutput with DecisionTransformer->TdMpc2
 class TdMpc2Output(ModelOutput):
@@ -113,25 +91,22 @@ class TdMpc2PreTrainedModel(PreTrainedModel):
 
     config_class = TdMpc2Config
     base_model_prefix = "td_mpc2"
-    main_input_name = "states"
+    main_input_name = "observations"
     supports_gradient_checkpointing = False
 
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
-                module.bias.data.zero_()
+                nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
+            nn.init.uniform_(module.weight, -0.02, 0.02)
+        elif isinstance(module, nn.ParameterList):
+            for i,p in enumerate(module):
+                if p.dim() == 3: # Linear
+                    nn.init.trunc_normal_(p, std=0.02) # Weight
+                    nn.init.constant_(module[i+1], 0) # Bias
 
 DECISION_TRANSFORMER_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) sub-class. Use
@@ -172,11 +147,12 @@ class Ensemble(nn.Module):
         self.base_model = copy.deepcopy(modules[0])
         self.base_model.to('meta')
         params, _ = torch.func.stack_module_state(modules)
+        params = tuple(params.values())
         self.vmap = torch.vmap(self._call_single_model, (0, 0, None), randomness='different', **kwargs)
         self.params = nn.ParameterList([nn.Parameter(p) for p in params])
 
     def _call_single_model(self,params, buffers, data):
-            return torch.func.functional_call(self.base_model, (params, buffers), (data,))
+        return torch.func.functional_call(self.base_model, (params, buffers), (data,))
     
     def forward(self, *args, **kwargs):
         return self.vmap([p for p in self.params], (), *args, **kwargs) 
@@ -203,17 +179,18 @@ class NormedLinear(nn.Module):
     Linear layer with LayerNorm, activation, and optionally dropout.
     """
 
-    def __init__(self, in_features,out_features, dropout=0., **kwargs):
+    def __init__(self, in_features,out_features, dropout=0., act=ACT2FN["mish"], **kwargs):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features,**kwargs)
         self.ln = nn.LayerNorm(out_features)
+        self.act = act
         self.dropout = nn.Dropout(dropout, inplace=True) if dropout else None
 
     def forward(self, x):
         x = self.linear(x)
         if self.dropout:
             x = self.dropout(x)
-        return ACT2FN["swish"](self.ln(x))
+        return self.act(self.ln(x))
 
 class ShiftAug(nn.Module):
 	"""
@@ -252,13 +229,12 @@ class PixelPreprocess(nn.Module):
 	def forward(self, x):
 		return x.div_(255.).sub_(0.5)
 
-class MLP(nn.Module):
+class MLP():
     """
     Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
     """
-    def __init__(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
-        super().__init__()
+    def mlp(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
         if isinstance(mlp_dims, int):
             mlp_dims = [mlp_dims]
         dims = [in_dim] + mlp_dims + [out_dim]
@@ -267,47 +243,43 @@ class MLP(nn.Module):
         for i in range(len(dims) - 2):
             self.mlp_layers.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
         self.mlp_layers.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
-        # return nn.Sequential(*self.mlp_layers)
+        return nn.Sequential(*self.mlp_layers)
         
-    def forward(self, x,output_hidden_states: bool = False):
+    def get_hidden_states(self, x,output_hidden_states: bool = False):
         self.hidden_states = () if output_hidden_states else None
         for mlp_layer in self.mlp_layers:
             x = mlp_layer(x)
             self.hidden_states = self.hidden_states + (x,) if output_hidden_states else None
-        return x
-    
-    def get_hidden_states(self):
         return self.hidden_states
 
-class conv(nn.Module):
+
+class Conv():
     """
     Basic convolutional encoder for TD-MPC2 with raw image observations.
     4 layers of convolution with ReLU activations, followed by a linear layer.
     """
-    def __init__(self, in_shape, num_channels, act=None):
-        super().__init__()
+    def conv(self, in_shape, num_channels, act=None):
         assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
         
-        conv_layers = [
+        self.conv_layers = [
             ShiftAug(), PixelPreprocess(),
             nn.Conv2d(in_shape[0], num_channels, 7, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 5, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 3, stride=2), nn.ReLU(inplace=True),
             nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
         if act:
-            conv_layers.append(act)
-        self.conv_layers = nn.ModuleList(conv_layers)
-        # return nn.Sequential(*layers)
+            self.conv_layers.append(act)
+        # self.conv_layers = nn.ModuleList(conv_layers)
+        return nn.Sequential(*self.conv_layers)
         
-    def forward(self, x):
-        self.hidden_states = []  # Initialize hidden states here to reset on each forward pass
+    def get_hidden_states(self, x,output_hidden_states: bool = False):
+        # Initialize hidden states here to reset on each forward pass
+        self.hidden_states = () if output_hidden_states else None
         for conv_layer in self.conv_layers:
             x = conv_layer(x)
-            self.hidden_states.append(x)
-        return x
-    
-    def get_hidden_states(self):
+            self.hidden_states = self.hidden_states + (x,) if output_hidden_states else None
         return self.hidden_states
+
 
 class EncodersDict():
     """
@@ -317,9 +289,9 @@ class EncodersDict():
         self.out = out
         for k in config.obs_shape.keys():
             if k == 'state':
-                self.out[k] = MLP(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1) * [config.enc_dim], config.latent_dim, act=SimNorm(config))
+                self.out[k] = MLP().mlp(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1) * [config.enc_dim], config.latent_dim, act=SimNorm(config))
             elif k == 'rgb':
-                self.out[k] = conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
+                self.out[k] = Conv().conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
             else:
                 raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
         return nn.ModuleDict(self.out)
@@ -340,10 +312,10 @@ class TdMpc2WorldModel(nn.Module):
             for i in range(len(config.tasks)):
                 self._action_masks[i, :config.action_dims[i]] = 1.
         self._encoder = enc_layers.enc(config)
-        self._dynamics = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
-        self._reward = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
-        self._pi = MLP(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
-        self._Qs = Ensemble([MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
+        self._dynamics = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
+        self._reward = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
+        self._pi = MLP().mlp(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
+        self._Qs = Ensemble([MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
         # self.apply(init.weight_init)
         # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
         self._target_Qs = deepcopy(self._Qs).requires_grad_(False)
@@ -502,7 +474,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.world_model = TdMpc2WorldModel()
+        self.world_model = TdMpc2WorldModel(config)
 
         # Initialize weights and apply final processing
         self.post_init()

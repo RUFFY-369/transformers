@@ -130,7 +130,7 @@ class TdMpc2Config(PretrainedConfig):
         num_channels= 32,
         mlp_dim= 512,
         latent_dim= 512,
-        task_dim= 96,
+        task_dim= 0,
         num_q= 5,
         dropout= 0.01,
         simnorm_dim= 8,
