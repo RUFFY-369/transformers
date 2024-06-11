@@ -104,6 +104,7 @@ class TdMpc2Config(PretrainedConfig):
         self,
         task= "dog-run",
         obs= "state",
+        device = "cuda:0",
         batch_size= 256,
         reward_coef= 0.1,
         value_coef= 0.1,
@@ -151,6 +152,7 @@ class TdMpc2Config(PretrainedConfig):
     ):
         self.task= task
         self.obs= obs
+        self.device= device
         self.batch_size= batch_size
         self.reward_coef= reward_coef
         self.value_coef= value_coef
