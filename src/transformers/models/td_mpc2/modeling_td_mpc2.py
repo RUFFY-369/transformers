@@ -72,13 +72,12 @@ class TdMpc2Output(ModelOutput):
             heads.
     """
 
-    state_preds: torch.FloatTensor = None
+    losses: torch.FloatTensor = None
     action_preds: torch.FloatTensor = None
+    reward_preds: torch.FloatTensor = None
     return_preds: torch.FloatTensor = None
     hidden_states: torch.FloatTensor = None
     attentions: torch.FloatTensor = None
-    last_hidden_state: torch.FloatTensor = None
-
 
 # Copied from transformers.models.decision_transformer.modeling_decision_transformer.DecisionTransformerPreTrainedModel with DecisionTransformer->TdMpc2,decision_transformer->td_mpc2
 class TdMpc2PreTrainedModel(PreTrainedModel):
@@ -223,6 +222,8 @@ def two_hot_inv(x, cfg):
     x = torch.sum(x * DREG_BINS, dim=-1, keepdim=True)
     return symexp(x)
     
+# from functorch import combine_state_for_ensemble
+
 class Ensemble(nn.Module):
     """
     Vectorized ensemble of modules.
@@ -233,16 +234,33 @@ class Ensemble(nn.Module):
         modules = nn.ModuleList(modules)
         self.base_model = copy.deepcopy(modules[0])
         self.base_model.to('meta')
-        params, _ = torch.func.stack_module_state(modules)
-        params = tuple(params.values())
-        self.vmap = torch.vmap(self._call_single_model, (0, 0, None), randomness='different', **kwargs)
-        self.params = nn.ParameterList([nn.Parameter(p) for p in params])
+        self.params_dict, _ = torch.func.stack_module_state(modules)
+        # self.params = nn.ParameterDict({key: nn.Parameter(value) for key, value in self.params.items()})
+        self.params = nn.ParameterList([nn.Parameter(p) for _,p in self.params_dict.items()])
+        self.vmap = torch.vmap(self._call_single_model, (0, 0, None), randomness='different',**kwargs)#randomness='different'
 
     def _call_single_model(self,params, buffers, data):
         return torch.func.functional_call(self.base_model, (params, buffers), (data,))
     
     def forward(self, *args, **kwargs):
-        return self.vmap([p for p in self.params], (), *args, **kwargs) 
+        return self.vmap({key: value for key, value in zip(self.params_dict.keys(),self.params)}, {}, *args, **kwargs) 
+
+# class Ensemble(nn.Module):
+# 	"""
+# 	Vectorized ensemble of modules.
+# 	"""
+
+# 	def __init__(self, modules, **kwargs):
+# 		super().__init__()
+# 		modules = nn.ModuleList(modules)
+# 		fn, params, _ = combine_state_for_ensemble(modules)
+# 		# print("fnnnnnnNN", fn,params)
+# 		self.vmap = torch.vmap(fn, in_dims=(0, 0, None), randomness='different', **kwargs)
+# 		self.params = nn.ParameterList([nn.Parameter(p) for p in params])
+# 		self._repr = str(modules)
+
+# 	def forward(self, *args, **kwargs):
+# 		return self.vmap([p for p in self.params], (), *args, **kwargs)
 
 class SimNorm(nn.Module):
     """
@@ -448,7 +466,7 @@ class TdMpc2WorldModel(nn.Module):
         self._dynamics = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
         self._reward = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
         self._pi = MLP().mlp(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
-        self._Qs = Ensemble([MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout) for _ in range(config.num_q)])
+        self._Qs = Ensemble([MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout).to(device=config.device) for _ in range(config.num_q)])
         self._Qs.base_model.to_empty(device=config.device)
         # self.apply(init.weight_init)
         # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])

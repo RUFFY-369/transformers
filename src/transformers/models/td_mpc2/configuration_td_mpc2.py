@@ -190,7 +190,7 @@ class TdMpc2Config(PretrainedConfig):
         self.obs_shapes= obs_shapes
         self.action_dims= action_dims
         self.episode_lengths= episode_lengths
-        self.bin_size= (self.vmax - self.vmin) / (self.num_bins-1),
+        self.bin_size= (self.vmax - self.vmin) / (self.num_bins-1)
 
         self.use_cache = use_cache
         self.pad_token_id = pad_token_id
