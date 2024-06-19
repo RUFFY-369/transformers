@@ -235,32 +235,16 @@ class Ensemble(nn.Module):
         self.base_model = copy.deepcopy(modules[0])
         self.base_model.to('meta')
         self.params_dict, _ = torch.func.stack_module_state(modules)
-        # self.params = nn.ParameterDict({key: nn.Parameter(value) for key, value in self.params.items()})
         self.params = nn.ParameterList([nn.Parameter(p) for _,p in self.params_dict.items()])
         self.vmap = torch.vmap(self._call_single_model, (0, 0, None), randomness='different',**kwargs)#randomness='different'
 
-    def _call_single_model(self,params, buffers, data):
-        return torch.func.functional_call(self.base_model, (params, buffers), (data,))
+    def _call_single_model(self,params, buffers, data, output_hidden_states: bool = False):
+        output, hidden_states = torch.func.functional_call(self.base_model, (params, buffers), (data, output_hidden_states))
+        return output, hidden_states
     
-    def forward(self, *args, **kwargs):
-        return self.vmap({key: value for key, value in zip(self.params_dict.keys(),self.params)}, {}, *args, **kwargs) 
-
-# class Ensemble(nn.Module):
-# 	"""
-# 	Vectorized ensemble of modules.
-# 	"""
-
-# 	def __init__(self, modules, **kwargs):
-# 		super().__init__()
-# 		modules = nn.ModuleList(modules)
-# 		fn, params, _ = combine_state_for_ensemble(modules)
-# 		# print("fnnnnnnNN", fn,params)
-# 		self.vmap = torch.vmap(fn, in_dims=(0, 0, None), randomness='different', **kwargs)
-# 		self.params = nn.ParameterList([nn.Parameter(p) for p in params])
-# 		self._repr = str(modules)
-
-# 	def forward(self, *args, **kwargs):
-# 		return self.vmap([p for p in self.params], (), *args, **kwargs)
+    def forward(self, *args, output_hidden_states: bool = False, **kwargs):
+        outputs, hidden_states =  self.vmap({key: value for key, value in zip(self.params_dict.keys(),self.params)}, {}, *args, output_hidden_states=output_hidden_states, **kwargs) 
+        return outputs, hidden_states if output_hidden_states else None
 
 class SimNorm(nn.Module):
     """
@@ -334,12 +318,13 @@ class PixelPreprocess(nn.Module):
     def forward(self, x):
         return x.div_(255.).sub_(0.5)
 
-class MLP():
+class MLP(nn.Module):
     """
     Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
     """
-    def mlp(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
+    def __init__(self, in_dim, mlp_dims, out_dim, act=None, dropout=0.):
+        super().__init__()
         if isinstance(mlp_dims, int):
             mlp_dims = [mlp_dims]
         dims = [in_dim] + mlp_dims + [out_dim]
@@ -348,14 +333,15 @@ class MLP():
         for i in range(len(dims) - 2):
             self.mlp_layers.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
         self.mlp_layers.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
-        return nn.Sequential(*self.mlp_layers)
+
         
-    def get_hidden_states(self, x,output_hidden_states: bool = False):
-        self.hidden_states = () if output_hidden_states else None
+    def forward(self, x,output_hidden_states: bool = False):
+        output = nn.Sequential(*self.mlp_layers)(x)
+        hidden_states = () if output_hidden_states else None
         for mlp_layer in self.mlp_layers:
             x = mlp_layer(x)
-            self.hidden_states = self.hidden_states + (x,) if output_hidden_states else None
-        return self.hidden_states
+            hidden_states = hidden_states + (x,) if output_hidden_states else None
+        return output,hidden_states if output_hidden_states else None
 
 
 class Conv():
@@ -363,7 +349,8 @@ class Conv():
     Basic convolutional encoder for TD-MPC2 with raw image observations.
     4 layers of convolution with ReLU activations, followed by a linear layer.
     """
-    def conv(self, in_shape, num_channels, act=None):
+    def __init__(self, in_shape, num_channels, act=None):
+        super().__init__()
         assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
         
         self.conv_layers = [
@@ -375,15 +362,15 @@ class Conv():
         if act:
             self.conv_layers.append(act)
         # self.conv_layers = nn.ModuleList(conv_layers)
-        return nn.Sequential(*self.conv_layers)
         
-    def get_hidden_states(self, x,output_hidden_states: bool = False):
+    def forward(self, x,output_hidden_states: bool = False):
+        output = nn.Sequential(*self.conv_layers)(x)
         # Initialize hidden states here to reset on each forward pass
-        self.hidden_states = () if output_hidden_states else None
+        hidden_states = () if output_hidden_states else None
         for conv_layer in self.conv_layers:
             x = conv_layer(x)
-            self.hidden_states = self.hidden_states + (x,) if output_hidden_states else None
-        return self.hidden_states
+            hidden_states = hidden_states + (x,) if output_hidden_states else None
+        return output,hidden_states if output_hidden_states else None
 
 
 class EncodersDict():
@@ -394,9 +381,9 @@ class EncodersDict():
         self.out = out
         for k in config.obs_shape.keys():
             if k == 'state':
-                self.out[k] = MLP().mlp(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1) * [config.enc_dim], config.latent_dim, act=SimNorm(config))
+                self.out[k] = MLP(config.obs_shape[k][0] + config.task_dim, max(config.num_enc_layers-1, 1) * [config.enc_dim], config.latent_dim, act=SimNorm(config))
             elif k == 'rgb':
-                self.out[k] = Conv().conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
+                self.out[k] = Conv(config.obs_shape[k], config.num_channels, act=SimNorm(config))
             else:
                 raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
         return nn.ModuleDict(self.out)
@@ -463,10 +450,10 @@ class TdMpc2WorldModel(nn.Module):
             for i in range(len(config.tasks)):
                 self._action_masks[i, :config.action_dims[i]] = 1.
         self._encoder = enc_layers.enc(config)
-        self._dynamics = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
-        self._reward = MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
-        self._pi = MLP().mlp(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
-        self._Qs = Ensemble([MLP().mlp(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout).to(device=config.device) for _ in range(config.num_q)])
+        self._dynamics = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], config.latent_dim, act=SimNorm(config))
+        self._reward = MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1))
+        self._pi = MLP(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
+        self._Qs = Ensemble([MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout).to(device=config.device) for _ in range(config.num_q)])
         self._Qs.base_model.to_empty(device=config.device)
         # self.apply(init.weight_init)
         # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
@@ -509,36 +496,38 @@ class TdMpc2WorldModel(nn.Module):
             emb = emb.repeat(x.shape[0], 1)
         return torch.cat([x, emb], dim=-1)
 
-    def encode(self, observations, tasks):
+    def encode(self, observations, tasks,output_hidden_states: bool = False):############HS##############
         """
-        Encodes an observationservation into its latent representation.
+        Encodes an observation into its latent representation.
         This implementation assumes a single state-based observation.
         """
         if self.config.multitask:
             observations = self.task_emb(observations, tasks)
         if self.config.obs == 'rgb' and observations.ndim == 5:
-            return torch.stack([self._encoder[self.config.obs](o) for o in observations])
-        return self._encoder[self.config.obs](observations)
+            encoded_out = [self._encoder[self.config.obs](o,output_hidden_states) for o in observations]
+            return torch.stack([out[0] for out in encoded_out]),tuple(out[1] for out in encoded_out)
+        encoded_out = self._encoder[self.config.obs](observations,output_hidden_states)
+        return encoded_out[0],encoded_out[1]
 
-    def next(self, z, a, tasks):
+    def next(self, z, a, tasks,output_hidden_states: bool = False):#########HS#######
         """
         Predicts the next latent state given the current latent state and action.
         """
         if self.config.multitask:
             z = self.task_emb(z, tasks)
         z = torch.cat([z, a], dim=-1)
-        return self._dynamics(z)
+        return self._dynamics(z,output_hidden_states)
     
-    def reward(self, z, a, tasks):
+    def reward(self, z, a, tasks,output_hidden_states: bool = False):##############hs###########
         """
         Predicts instantaneous (single-step) reward.
         """
         if self.config.multitask:
             z = self.task_emb(z, tasks)
         z = torch.cat([z, a], dim=-1)
-        return self._reward(z)
+        return self._reward(z,output_hidden_states)
 
-    def pi(self, z, tasks):
+    def pi(self, z, tasks,output_hidden_states: bool = False):#################HS################3
         """
         Samples an action from the policy prior.
         The policy prior is a Gaussian distribution with
@@ -548,7 +537,8 @@ class TdMpc2WorldModel(nn.Module):
             z = self.task_emb(z, tasks)
 
         # Gaussian policy prior
-        mu, log_strd = self._pi(z).chunk(2, dim=-1)
+        pi_out, hidden_states_pi  = self._pi(z,output_hidden_states) 
+        mu, log_strd = pi_out.chunk(2, dim=-1)
         log_strd = log_std(log_strd, self.log_std_min, self.log_std_dif)
         eps = torch.randn_like(mu)
 
@@ -564,9 +554,9 @@ class TdMpc2WorldModel(nn.Module):
         pi = mu + eps * log_strd.exp()
         mu, pi, log_pi = squash(mu, pi, log_pi)
 
-        return mu, pi, log_pi, log_strd
+        return mu, pi, log_pi, log_strd, hidden_states_pi
 
-    def Q(self, z, a, tasks, return_type='min', target=False):
+    def Q(self, z, a, tasks, return_type='min', target=False, output_hidden_states: bool = False):################HS###########
         """
         Predict state-action value.
         `return_type` can be one of [`min`, `avg`, `all`]:
@@ -581,14 +571,14 @@ class TdMpc2WorldModel(nn.Module):
             z = self.task_emb(z, tasks)
             
         z = torch.cat([z, a], dim=-1)
-        out = (self._target_Qs if target else self._Qs)(z)
+        out,hidden_states_Qs = (self._target_Qs if target else self._Qs)(z,output_hidden_states)
 
         if return_type == 'all':
-            return out
+            return out,hidden_states_Qs
 
         Q1, Q2 = out[np.random.choice(self.config.num_q, 2, replace=False)]
         Q1, Q2 = two_hot_inv(Q1, self.config), two_hot_inv(Q2, self.config)
-        return torch.min(Q1, Q2) if return_type == 'min' else (Q1 + Q2) / 2
+        return torch.min(Q1, Q2) if return_type == 'min' else (Q1 + Q2) / 2,hidden_states_Qs
 
 
 class TdMpc2Losses():
@@ -647,7 +637,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             frac = episode_length/self.config.discount_denom
             return min(max((frac-1)/(frac), self.config.discount_min), self.config.discount_max)
     
-    def _td_target(self, next_z, reward, tasks):
+    def _td_target(self, next_z, reward, tasks,output_hidden_states: bool = False):
         """
         Compute the TD-target from a reward and the observation at the following time step.
         
@@ -659,17 +649,18 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         Returns:
             torch.Tensor: TD-target.
         """
-        pi = self.world_model.pi(next_z, tasks)[1]
+        pi = self.world_model.pi(next_z, tasks, output_hidden_states)[1]
 
         discount = torch.tensor(
             [self._get_discount(ep_len) for ep_len in self.config.episode_lengths], device='cuda'
         ) if self.config.multitask else self._get_discount(self.config.episode_length)
 
         discount = discount[tasks].unsqueeze(-1) if self.config.multitask else discount
+        Q_out = self.world_model.Q(next_z, pi, tasks, return_type='min', target=True,output_hidden_states = output_hidden_states)
         
-        return reward + discount * self.world_model.Q(next_z, pi, tasks, return_type='min', target=True)
+        return reward + discount * Q_out[0],Q_out[1]
     
-    def update_pi(self, zs, task):
+    def update_pi(self, zs, task,output_hidden_states: bool = False):
         """
         Update policy using a sequence of latent states.
 
@@ -681,8 +672,8 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             float: Loss of the policy update.
         """
         self.world_model.track_q_grad(False)
-        _, pis, log_pis, _ = self.world_model.pi(zs, task)
-        qs = self.world_model.Q(zs, pis, task, return_type='avg')
+        action_pred, pis, log_pis, _, hidden_states_pi = self.world_model.pi(zs, task,output_hidden_states)
+        qs, hidden_states_upd_pi_Q= self.world_model.Q(zs, pis, task, return_type='avg', output_hidden_states = output_hidden_states)
         self.scale.update(qs[0])
         qs = self.scale(qs)
 
@@ -692,7 +683,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         torch.nn.utils.clip_grad_norm_(self.world_model._pi.parameters(), self.config.grad_clip_norm)
         self.world_model.track_q_grad(True)
 
-        return pi_loss.item()
+        return pi_loss.item(), action_pred, hidden_states_pi,hidden_states_upd_pi_Q
 
     @add_start_docstrings_to_model_forward(DECISION_TRANSFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=TdMpc2Output, config_class=_CONFIG_FOR_DOC)
@@ -755,29 +746,28 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         # # timesteps-1,batch_size,observation_dim_dog_run, timesteps-1,batch_size,action_dim_dog_run, timesteps-1,batch_size
 
         with torch.no_grad():
-            next_z = self.world_model.encode(observations[1:], tasks)
-            td_targets = self._td_target(next_z, rewards, tasks)
+            next_z,hidden_states_next_z = self.world_model.encode(observations[1:], tasks,output_hidden_states)
+            td_targets,hidden_states_td_target_Q = self._td_target(next_z, rewards, tasks)
         
         losses_td_mpc2 = TdMpc2Losses()
         zs = torch.empty(self.config.horizon+1, self.config.batch_size, self.config.latent_dim, device=self.device)
-        z = self.world_model.encode(observations[0], tasks)
+        z, hidden_states_z = self.world_model.encode(observations[0], tasks,output_hidden_states)
         zs[0] = z
         z_copy = zs.clone()
 
         for t in range(self.config.horizon):
-            z = self.world_model.next(z, actions[t], tasks)
+            z,hidden_states_next_state = self.world_model.next(z, actions[t], tasks,output_hidden_states)
             zs[t+1] = z
 
         # Predictions
         _zs = zs[:-1]
-        qs = self.world_model.Q(_zs, actions, tasks, return_type='all')
-        reward_preds = self.world_model.reward(_zs, actions, tasks)
+        qs,hidden_states_actions_Q = self.world_model.Q(_zs, actions, tasks, return_type='all', output_hidden_states = output_hidden_states)
+        reward_preds,hidden_states_rewards = self.world_model.reward(_zs, actions, tasks,output_hidden_states)
 
         self.world_model.track_q_grad(False)
-        action_pred, _,_,_ = self.world_model.pi(zs.detach(), tasks)
 
         total_loss = losses_td_mpc2.compute_total_losses(self.config,rewards,z_copy,next_z,reward_preds,td_targets,qs)
-        pi_loss = self.update_pi(zs.detach(), tasks)
+        pi_loss, action_pred, hidden_states_pi,hidden_states_upd_pi_Q = self.update_pi(zs.detach(), tasks)
         total_model_loss = (total_loss,pi_loss)
 
         if not return_dict:
