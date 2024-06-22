@@ -236,14 +236,17 @@ class Ensemble(nn.Module):
         self.base_model.to('meta')
         self.params_dict, _ = torch.func.stack_module_state(modules)
         self.params = nn.ParameterList([nn.Parameter(p) for _,p in self.params_dict.items()])
-        self.vmap = torch.vmap(self._call_single_model, (0, 0, None), randomness='different',**kwargs)#randomness='different'
+        self.vmap = torch.func.vmap(self._call_single_model, (0, 0, None, None), randomness='different',**kwargs)#randomness='different'
 
     def _call_single_model(self,params, buffers, data, output_hidden_states: bool = False):
         output, hidden_states = torch.func.functional_call(self.base_model, (params, buffers), (data, output_hidden_states))
         return output, hidden_states
     
-    def forward(self, *args, output_hidden_states: bool = False, **kwargs):
-        outputs, hidden_states =  self.vmap({key: value for key, value in zip(self.params_dict.keys(),self.params)}, {}, *args, output_hidden_states=output_hidden_states, **kwargs) 
+    def forward(self, x, output_hidden_states: bool = False, **kwargs):
+        params_dict = {key: value for key, value in zip(self.params_dict.keys(), self.params)}
+        outputs, hidden_states = self.vmap(
+            params_dict, {}, x, output_hidden_states
+        )
         return outputs, hidden_states if output_hidden_states else None
 
 class SimNorm(nn.Module):
@@ -341,7 +344,7 @@ class MLP(nn.Module):
         for mlp_layer in self.mlp_layers:
             x = mlp_layer(x)
             hidden_states = hidden_states + (x,) if output_hidden_states else None
-        return output,hidden_states if output_hidden_states else None
+        return output,hidden_states if output_hidden_states else torch.empty((0,0))
 
 
 class Conv():
@@ -693,9 +696,9 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         actions: Optional[torch.FloatTensor] = None,
         rewards: Optional[torch.FloatTensor] = None,
         tasks: Optional[torch.FloatTensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = True,
+        output_attentions: Optional[bool] = True,
+        return_dict: Optional[bool] = True,
     ) -> Union[Tuple[torch.FloatTensor], TdMpc2Output]:
         r"""
         Returns:
@@ -746,9 +749,8 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         # # timesteps-1,batch_size,observation_dim_dog_run, timesteps-1,batch_size,action_dim_dog_run, timesteps-1,batch_size
 
         with torch.no_grad():
-            next_z,hidden_states_next_z = self.world_model.encode(observations[1:], tasks,output_hidden_states)
-            td_targets,hidden_states_td_target_Q = self._td_target(next_z, rewards, tasks)
-        
+            next_z,hidden_states_next_z = self.world_model.encode(observations[1:], tasks, output_hidden_states)
+            td_targets,hidden_states_td_target_Q = self._td_target(next_z, rewards, tasks, output_hidden_states)
         losses_td_mpc2 = TdMpc2Losses()
         zs = torch.empty(self.config.horizon+1, self.config.batch_size, self.config.latent_dim, device=self.device)
         z, hidden_states_z = self.world_model.encode(observations[0], tasks,output_hidden_states)
@@ -767,8 +769,18 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         self.world_model.track_q_grad(False)
 
         total_loss = losses_td_mpc2.compute_total_losses(self.config,rewards,z_copy,next_z,reward_preds,td_targets,qs)
-        pi_loss, action_pred, hidden_states_pi,hidden_states_upd_pi_Q = self.update_pi(zs.detach(), tasks)
+        pi_loss, action_pred, hidden_states_pi,hidden_states_upd_pi_Q = self.update_pi(zs.detach(), tasks, output_hidden_states)
         total_model_loss = (total_loss,pi_loss)
+
+        all_hidden_states = (
+            hidden_states_next_z + hidden_states_td_target_Q + hidden_states_z + hidden_states_next_state + hidden_states_actions_Q + hidden_states_rewards + hidden_states_pi + hidden_states_upd_pi_Q
+            if output_hidden_states
+            else None
+        )
+        
+        if output_hidden_states:
+            for hidden_state in all_hidden_states:
+                hidden_state.requires_grad_(True)
 
         if not return_dict:
             return tuple(
@@ -778,7 +790,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
                     action_pred,
                     reward_preds,
                     td_targets,
-                    None,
+                    all_hidden_states,
                     None,
                 ]
                 if v is not None
@@ -789,6 +801,6 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             action_preds=action_pred,
             reward_preds=reward_preds,
             return_preds=td_targets,
-            hidden_states=None,
+            hidden_states=all_hidden_states,
             attentions=None,
         )
