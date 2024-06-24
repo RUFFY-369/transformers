@@ -755,12 +755,13 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         zs = torch.empty(self.config.horizon+1, self.config.batch_size, self.config.latent_dim, device=self.device)
         z, hidden_states_z = self.world_model.encode(observations[0], tasks,output_hidden_states)
         zs[0] = z
-        z_copy = zs.clone()
+
 
         for t in range(self.config.horizon):
             z,hidden_states_next_state = self.world_model.next(z, actions[t], tasks,output_hidden_states)
             zs[t+1] = z
 
+        z_copy = zs.clone()
         # Predictions
         _zs = zs[:-1]
         qs,hidden_states_actions_Q = self.world_model.Q(_zs, actions, tasks, return_type='all', output_hidden_states = output_hidden_states)
