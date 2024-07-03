@@ -398,13 +398,13 @@ class TextGenerationPipelineTests(unittest.TestCase):
             self.assertEqual(outputs, [{"generated_text": ANY(str)}])
         else:
             with self.assertRaises((ValueError, AssertionError)):
-                outputs = text_generator("")
+                outputs = text_generator("", add_special_tokens=False)
 
         if text_generator.framework == "tf":
             # TF generation does not support max_new_tokens, and it's impossible
             # to control long generation with only max_length without
             # fancy calculation, dismissing tests for now.
-            return
+            self.skipTest(reason="TF generation does not support max_new_tokens")
         # We don't care about infinite range models.
         # They already work.
         # Skip this test for XGLM, since it uses sinusoidal positional embeddings which are resized on-the-fly.
