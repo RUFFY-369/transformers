@@ -99,11 +99,20 @@ class TdMpc2PreTrainedModel(PreTrainedModel):
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.Embedding):
             nn.init.uniform_(module.weight, -0.02, 0.02)
-        elif isinstance(module, nn.ParameterList):
-            for i,p in enumerate(module):
+        elif isinstance(module, Ensemble): # nn.ParameterList
+            # Initialize parameters to zero (second last linear layer needs zero initialization on weights)
+            for p in module.params[-2]:
+                p.data.fill_(0)
+                
+            for i,p in enumerate(module.params):
                 if p.dim() == 3: # Linear
                     nn.init.trunc_normal_(p, std=0.02) # Weight
-                    nn.init.constant_(module[i+1], 0) # Bias
+                    nn.init.constant_(module.params[i+1], 0) # Bias
+        elif isinstance(module, TdMpc2Model): # for rewards init
+            # Initialize parameters to zero (last linear layer needs zero initialization on weights)
+            for p in module.world_model._reward.mlp_layers[-1].weight:
+                p.data.fill_(0)
+        
 
 DECISION_TRANSFORMER_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) sub-class. Use
@@ -336,10 +345,11 @@ class MLP(nn.Module):
         for i in range(len(dims) - 2):
             self.mlp_layers.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
         self.mlp_layers.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
+        self.mlp_layers = nn.Sequential(*self.mlp_layers)
 
         
     def forward(self, x,output_hidden_states: bool = False):
-        output = nn.Sequential(*self.mlp_layers)(x)
+        output = self.mlp_layers(x)
         hidden_states = () if output_hidden_states else None
         for mlp_layer in self.mlp_layers:
             x = mlp_layer(x)
@@ -347,7 +357,7 @@ class MLP(nn.Module):
         return output,hidden_states if output_hidden_states else torch.empty((0,0))
 
 
-class Conv():
+class Conv(nn.Module):
     """
     Basic convolutional encoder for TD-MPC2 with raw image observations.
     4 layers of convolution with ReLU activations, followed by a linear layer.
@@ -364,10 +374,11 @@ class Conv():
             nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
         if act:
             self.conv_layers.append(act)
+        self.conv_layers = nn.Sequential(*self.conv_layers)
         # self.conv_layers = nn.ModuleList(conv_layers)
         
     def forward(self, x,output_hidden_states: bool = False):
-        output = nn.Sequential(*self.conv_layers)(x)
+        output = self.conv_layers(x)
         # Initialize hidden states here to reset on each forward pass
         hidden_states = () if output_hidden_states else None
         for conv_layer in self.conv_layers:
@@ -458,8 +469,6 @@ class TdMpc2WorldModel(nn.Module):
         self._pi = MLP(config.latent_dim + config.task_dim, 2*[config.mlp_dim], 2*config.action_dim)
         self._Qs = Ensemble([MLP(config.latent_dim + config.action_dim + config.task_dim, 2*[config.mlp_dim], max(config.num_bins, 1), dropout=config.dropout).to(device=config.device) for _ in range(config.num_q)])
         self._Qs.base_model.to_empty(device=config.device)
-        # self.apply(init.weight_init)
-        # init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
         self._target_Qs = deepcopy(self._Qs).requires_grad_(False)
         self.log_std_min = torch.tensor(config.log_std_min)
         self.log_std_dif = torch.tensor(config.log_std_max) - self.log_std_min
