@@ -28,7 +28,6 @@ from ...test_pipeline_mixin import PipelineTesterMixin
 
 if is_torch_available():
     import torch
-
     from transformers import TdMpc2Model
 
 
@@ -36,51 +35,46 @@ class TdMpc2ModelTester:
     def __init__(
         self,
         parent,
-        batch_size=13,
-        seq_length=7,
-        act_dim=6,
-        state_dim=17,
-        hidden_size=23,
-        max_length=11,
+        batch_size=8,
+        horizon=3,
+        act_dim=38,
+        state_dim=223,
+        tasks=None, #For single task its None unless multitasking training is done
+        # hidden_size=23,
+        # max_length=11,
         is_training=True,
     ):
         self.parent = parent
         self.batch_size = batch_size
-        self.seq_length = seq_length
+        self.horizon = horizon
         self.act_dim = act_dim
         self.state_dim = state_dim
-        self.hidden_size = hidden_size
-        self.max_length = max_length
+        self.tasks = tasks
+        # self.hidden_size = hidden_size
+        # self.max_length = max_length
         self.is_training = is_training
 
     def prepare_config_and_inputs(self):
-        states = floats_tensor((self.batch_size, self.seq_length, self.state_dim))
-        actions = floats_tensor((self.batch_size, self.seq_length, self.act_dim))
-        rewards = floats_tensor((self.batch_size, self.seq_length, 1))
-        returns_to_go = floats_tensor((self.batch_size, self.seq_length, 1))
-        timesteps = ids_tensor((self.batch_size, self.seq_length), vocab_size=1000)
-        attention_mask = random_attention_mask((self.batch_size, self.seq_length))
-
         config = self.get_config()
+        # Generate a random float between the range from -1216.0 to 2040.0
+        states =  (floats_tensor((self.horizon+1,self.batch_size, self.state_dim)) * 3256.0) - 1216.0 #(states*(2040.0 + 1216.0))-1216.0
+        #Generate a random float between the range from -1.0 to 1.0
+        actions = (floats_tensor((self.horizon,self.batch_size, self.act_dim)) * 2) - 1
+        rewards = floats_tensor((self.horizon,self.batch_size, 1))
+        tasks = self.tasks
 
         return (
             config,
             states,
             actions,
             rewards,
-            returns_to_go,
-            timesteps,
-            attention_mask,
+            tasks,
         )
 
     def get_config(self):
         return TdMpc2Config(
             batch_size=self.batch_size,
-            seq_length=self.seq_length,
-            act_dim=self.act_dim,
-            state_dim=self.state_dim,
-            hidden_size=self.hidden_size,
-            max_length=self.max_length,
+            horizon=self.horizon,
         )
 
     def create_and_check_model(
@@ -89,21 +83,20 @@ class TdMpc2ModelTester:
         states,
         actions,
         rewards,
-        returns_to_go,
-        timesteps,
-        attention_mask,
+        tasks,
     ):
         model = TdMpc2Model(config=config)
         model.to(torch_device)
         model.eval()
-        result = model(states, actions, rewards, returns_to_go, timesteps, attention_mask)
+        result = model(states, actions, rewards, tasks)
 
-        self.parent.assertEqual(result.state_preds.shape, states.shape)
-        self.parent.assertEqual(result.action_preds.shape, actions.shape)
-        self.parent.assertEqual(result.return_preds.shape, returns_to_go.shape)
-        self.parent.assertEqual(
-            result.last_hidden_state.shape, (self.batch_size, self.seq_length * 3, self.hidden_size)
-        )  # seq length *3 as there are 3 modelities: states, returns and actions
+        action_pred_expected_shape = torch.Size((actions.shape[0]+1,actions.shape[1],actions.shape[2])) # first index:horizon+1
+        reward_pred_expected_shape = torch.Size((rewards.shape[0],rewards.shape[1],config.num_bins))
+        
+        self.parent.assertEqual(result.action_preds.shape, action_pred_expected_shape)
+        self.parent.assertEqual(result.reward_preds.shape, reward_pred_expected_shape)
+        #td targets
+        self.parent.assertEqual(result.return_preds.shape, rewards.shape)
 
     def prepare_config_and_inputs_for_common(self):
         config_and_inputs = self.prepare_config_and_inputs()
@@ -112,17 +105,13 @@ class TdMpc2ModelTester:
             states,
             actions,
             rewards,
-            returns_to_go,
-            timesteps,
-            attention_mask,
+            tasks,
         ) = config_and_inputs
         inputs_dict = {
-            "states": states,
+            "observations": states,
             "actions": actions,
             "rewards": rewards,
-            "returns_to_go": returns_to_go,
-            "timesteps": timesteps,
-            "attention_mask": attention_mask,
+            "tasks": tasks,
         }
         return config, inputs_dict
 
@@ -147,7 +136,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
 
     def setUp(self):
         self.model_tester = TdMpc2ModelTester(self)
-        self.config_tester = ConfigTester(self, config_class=TdMpc2Config, hidden_size=37)
+        self.config_tester = ConfigTester(self, config_class=TdMpc2Config, hidden_size=512)
 
     def test_config(self):
         self.config_tester.run_common_tests()
@@ -172,12 +161,10 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
             arg_names = [*signature.parameters.keys()]
 
             expected_arg_names = [
-                "states",
+                "observations",
                 "actions",
                 "rewards",
-                "returns_to_go",
-                "timesteps",
-                "attention_mask",
+                "tasks",
             ]
 
             self.assertListEqual(arg_names[: len(expected_arg_names)], expected_arg_names)
@@ -188,59 +175,41 @@ class TdMpc2ModelIntegrationTest(unittest.TestCase):
     @slow
     def test_autoregressive_prediction(self):
         """
-        An integration test that performs autoregressive prediction of state, action and return
-        from a sequence of state, actions and returns. Test is performed over two timesteps.
+        An integration test that performs predicts outcomes (returns) conditioned on a sequence of actions, joint-embedding prediction
+        (for multitask dataset,this test use single task), rewards, and TD-learning without decoding observations from a sequence of 
+        observations,actions,rewards and task embeddings. Test is performed over two timesteps.
+
 
         """
 
-        NUM_STEPS = 2  # number of steps of autoregressive prediction we will perform
-        TARGET_RETURN = 10  # defined by the RL environment, may be normalized
-        model = TdMpc2Model.from_pretrained("edbeeching/decision-transformer-gym-hopper-expert")
+        NUM_STEPS = 1  # number of steps of prediction we will perform
+        batch_size = 1
+        model = TdMpc2Model.from_pretrained("ruffy369/tdmpc2-dog-run")
         model = model.to(torch_device)
+        model.eval()
         config = model.config
         torch.manual_seed(0)
-        state = torch.randn(1, 1, config.state_dim).to(device=torch_device, dtype=torch.float32)  # env.reset()
 
         expected_outputs = torch.tensor(
             [[0.242793, -0.28693074, 0.8742613], [0.67815274, -0.08101085, -0.12952147]], device=torch_device
         )
+        
 
-        returns_to_go = torch.tensor(TARGET_RETURN, device=torch_device, dtype=torch.float32).reshape(1, 1, 1)
-        states = state
-        actions = torch.zeros(1, 0, config.act_dim, device=torch_device, dtype=torch.float32)
-        rewards = torch.zeros(1, 0, device=torch_device, dtype=torch.float32)
-        timesteps = torch.tensor(0, device=torch_device, dtype=torch.long).reshape(1, 1)
-
+        states =  (torch.rand(config.horizon+1,batch_size, config.obs_shape['state']) * 3256.0) - 1216.0 #(states*(2040.0 + 1216.0))-1216.0
+        actions = (torch.rand(config.horizon,batch_size,config.action_dim) * 2) - 1
+        rewards = torch.rand(config.horizon,batch_size, 1)
+        task = None
+        
         for step in range(NUM_STEPS):
-            actions = torch.cat([actions, torch.zeros(1, 1, config.act_dim, device=torch_device)], dim=1)
-            rewards = torch.cat([rewards, torch.zeros(1, 1, device=torch_device)], dim=1)
-
-            attention_mask = torch.ones(1, states.shape[1]).to(dtype=torch.long, device=states.device)
-
             with torch.no_grad():
-                _, action_pred, _ = model(
-                    states=states,
+                model_pred = model(
+                    observations=states,
                     actions=actions,
                     rewards=rewards,
-                    returns_to_go=returns_to_go,
-                    timesteps=timesteps,
-                    attention_mask=attention_mask,
-                    return_dict=False,
+                    tasks = task,
+                    return_dict=True,
                 )
 
-            self.assertEqual(action_pred.shape, actions.shape)
-            self.assertTrue(torch.allclose(action_pred[0, -1], expected_outputs[step], atol=1e-4))
-            state, reward, _, _ = (  # env.step(action)
-                torch.randn(1, 1, config.state_dim).to(device=torch_device, dtype=torch.float32),
-                1.0,
-                False,
-                {},
-            )
-
-            actions[-1] = action_pred[0, -1]
-            states = torch.cat([states, state], dim=1)
-            pred_return = returns_to_go[0, -1] - reward
-            returns_to_go = torch.cat([returns_to_go, pred_return.reshape(1, 1, 1)], dim=1)
-            timesteps = torch.cat(
-                [timesteps, torch.ones((1, 1), device=torch_device, dtype=torch.long) * (step + 1)], dim=1
-            )
+            actions_expected_shape = torch.Size((actions.shape[0]+1, actions.shape[1],actions.shape[2]))
+            self.assertEqual(model_pred.action_preds.shape, actions_expected_shape)
+            self.assertTrue(torch.allclose(model_pred.action_preds, expected_outputs[step], atol=1e-4))

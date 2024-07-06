@@ -96,8 +96,8 @@ class TdMpc2Config(PretrainedConfig):
     model_type = "td_mpc2"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
-        "hidden_size": "embed_dim_world_model",
-        "num_hidden_layers": "n_layer",
+        "hidden_size": "latent_dim",
+        "num_hidden_layers": "num_enc_layers",
     }
 
     def __init__(
@@ -122,7 +122,7 @@ class TdMpc2Config(PretrainedConfig):
         log_std_min= -10,
         log_std_max= 2,
         entropy_coef= 1e-4,
-        num_bins= 101,
+        num_bins= 101, #discretizing the continuous reward space into a finite number of intervals or categories. 
         vmin= -10,
         vmax= +10,
         # model_size= 1,
