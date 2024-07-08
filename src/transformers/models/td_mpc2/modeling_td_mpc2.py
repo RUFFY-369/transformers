@@ -72,8 +72,8 @@ class TdMpc2Output(ModelOutput):
             heads.
     """
 
-    losses: torch.FloatTensor = None
     action_preds: torch.FloatTensor = None
+    losses: torch.FloatTensor = None
     reward_preds: torch.FloatTensor = None
     return_preds: torch.FloatTensor = None
     hidden_states: torch.FloatTensor = None
@@ -349,12 +349,11 @@ class MLP(nn.Module):
 
         
     def forward(self, x,output_hidden_states: bool = False):
-        output = self.mlp_layers(x)
         hidden_states = () if output_hidden_states else None
         for mlp_layer in self.mlp_layers:
             x = mlp_layer(x)
             hidden_states = hidden_states + (x,) if output_hidden_states else None
-        return output,hidden_states if output_hidden_states else torch.empty((0,0))
+        return x,hidden_states if output_hidden_states else torch.empty((0,0))
 
 
 class Conv(nn.Module):
@@ -378,13 +377,12 @@ class Conv(nn.Module):
         # self.conv_layers = nn.ModuleList(conv_layers)
         
     def forward(self, x,output_hidden_states: bool = False):
-        output = self.conv_layers(x)
         # Initialize hidden states here to reset on each forward pass
         hidden_states = () if output_hidden_states else None
         for conv_layer in self.conv_layers:
             x = conv_layer(x)
             hidden_states = hidden_states + (x,) if output_hidden_states else None
-        return output,hidden_states if output_hidden_states else None
+        return x,hidden_states if output_hidden_states else None
 
 
 class EncodersDict():
@@ -407,8 +405,8 @@ class RunningScale:
 
     def __init__(self, config):
         self.config = config
-        self._value = torch.ones(1, dtype=torch.float32, device=torch.device('cuda'))
-        self._percentiles = torch.tensor([5, 95], dtype=torch.float32, device=torch.device('cuda'))
+        self._value = torch.ones(1, dtype=torch.float32, device=torch.device(config.device))
+        self._percentiles = torch.tensor([5, 95], dtype=torch.float32, device=torch.device(config.device))
 
     def state_dict(self):
         return dict(value=self._value, percentiles=self._percentiles)
@@ -517,8 +515,15 @@ class TdMpc2WorldModel(nn.Module):
             observations = self.task_emb(observations, tasks)
         if self.config.obs == 'rgb' and observations.ndim == 5:
             encoded_out = [self._encoder[self.config.obs](o,output_hidden_states) for o in observations]
+            if output_hidden_states:
+                for out in encoded_out:
+                    for hidden_state in out[1]:
+                        hidden_state.requires_grad_(True)
             return torch.stack([out[0] for out in encoded_out]),tuple(out[1] for out in encoded_out)
         encoded_out = self._encoder[self.config.obs](observations,output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in encoded_out[1]:
+                    hidden_state.requires_grad_(True)
         return encoded_out[0],encoded_out[1]
 
     def next(self, z, a, tasks,output_hidden_states: bool = False):#########HS#######
@@ -550,6 +555,9 @@ class TdMpc2WorldModel(nn.Module):
 
         # Gaussian policy prior
         pi_out, hidden_states_pi  = self._pi(z,output_hidden_states) 
+        if output_hidden_states:
+            for hidden_state in hidden_states_pi:
+                    hidden_state.requires_grad_(True)
         mu, log_strd = pi_out.chunk(2, dim=-1)
         log_strd = log_std(log_strd, self.log_std_min, self.log_std_dif)
         eps = torch.randn_like(mu)
@@ -584,6 +592,9 @@ class TdMpc2WorldModel(nn.Module):
             
         z = torch.cat([z, a], dim=-1)
         out,hidden_states_Qs = (self._target_Qs if target else self._Qs)(z,output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in hidden_states_Qs:
+                    hidden_state.requires_grad_(True)
 
         if return_type == 'all':
             return out,hidden_states_Qs
@@ -664,7 +675,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         pi = self.world_model.pi(next_z, tasks, output_hidden_states)[1]
 
         discount = torch.tensor(
-            [self._get_discount(ep_len) for ep_len in self.config.episode_lengths], device='cuda'
+            [self._get_discount(ep_len) for ep_len in self.config.episode_lengths], device=self.config.device
         ) if self.config.multitask else self._get_discount(self.config.episode_length)
 
         discount = discount[tasks].unsqueeze(-1) if self.config.multitask else discount
@@ -685,7 +696,13 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         """
         self.world_model.track_q_grad(False)
         action_pred, pis, log_pis, _, hidden_states_pi = self.world_model.pi(zs, task,output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in hidden_states_pi:
+                    hidden_state.requires_grad_(True)
         qs, hidden_states_upd_pi_Q= self.world_model.Q(zs, pis, task, return_type='avg', output_hidden_states = output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in hidden_states_upd_pi_Q:
+                    hidden_state.requires_grad_(True)
         self.scale.update(qs[0])
         qs = self.scale(qs)
 
@@ -695,7 +712,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         torch.nn.utils.clip_grad_norm_(self.world_model._pi.parameters(), self.config.grad_clip_norm)
         self.world_model.track_q_grad(True)
 
-        return pi_loss.item(), action_pred, hidden_states_pi,hidden_states_upd_pi_Q
+        return pi_loss, action_pred, hidden_states_pi,hidden_states_upd_pi_Q
 
     @add_start_docstrings_to_model_forward(DECISION_TRANSFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=TdMpc2Output, config_class=_CONFIG_FOR_DOC)
@@ -706,7 +723,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         rewards: Optional[torch.FloatTensor] = None,
         tasks: Optional[torch.FloatTensor] = None,
         output_hidden_states: Optional[bool] = True,
-        output_attentions: Optional[bool] = True,
+        output_attentions: Optional[bool] = False,
         return_dict: Optional[bool] = True,
     ) -> Union[Tuple[torch.FloatTensor], TdMpc2Output]:
         r"""
@@ -758,16 +775,23 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         # # timesteps-1,batch_size,observation_dim_dog_run, timesteps-1,batch_size,action_dim_dog_run, timesteps-1,batch_size
 
         with torch.no_grad():
-            next_z,hidden_states_next_z = self.world_model.encode(observations[1:], tasks, output_hidden_states)
-            td_targets,hidden_states_td_target_Q = self._td_target(next_z, rewards, tasks, output_hidden_states)
+            next_z,_ = self.world_model.encode(observations[1:], tasks, output_hidden_states)
+            td_targets,_ = self._td_target(next_z, rewards, tasks, output_hidden_states)
+
         losses_td_mpc2 = TdMpc2Losses()
         zs = torch.empty(self.config.horizon+1, self.config.batch_size, self.config.latent_dim, device=self.device)
         z, hidden_states_z = self.world_model.encode(observations[0], tasks,output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in hidden_states_z:
+                    hidden_state.requires_grad_(True)
         zs[0] = z
 
 
         for t in range(self.config.horizon):
             z,hidden_states_next_state = self.world_model.next(z, actions[t], tasks,output_hidden_states)
+            if output_hidden_states:
+                for hidden_state in hidden_states_next_state:
+                    hidden_state.requires_grad_(True)
             zs[t+1] = z
 
         z_copy = zs.clone()
@@ -775,6 +799,9 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         _zs = zs[:-1]
         qs,hidden_states_actions_Q = self.world_model.Q(_zs, actions, tasks, return_type='all', output_hidden_states = output_hidden_states)
         reward_preds,hidden_states_rewards = self.world_model.reward(_zs, actions, tasks,output_hidden_states)
+        if output_hidden_states:
+            for hidden_state in hidden_states_rewards:
+                    hidden_state.requires_grad_(True)
 
         self.world_model.track_q_grad(False)
 
@@ -783,21 +810,17 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
         total_model_loss = (total_loss,pi_loss)
 
         all_hidden_states = (
-            hidden_states_next_z + hidden_states_td_target_Q + hidden_states_z + hidden_states_next_state + hidden_states_actions_Q + hidden_states_rewards + hidden_states_pi + hidden_states_upd_pi_Q
+            hidden_states_z + hidden_states_next_state + hidden_states_actions_Q + hidden_states_rewards + hidden_states_pi + hidden_states_upd_pi_Q
             if output_hidden_states
             else None
         )
         
-        if output_hidden_states:
-            for hidden_state in all_hidden_states:
-                hidden_state.requires_grad_(True)
-
         if not return_dict:
             return tuple(
                 v
                 for v in [
-                    total_model_loss,
                     action_pred,
+                    total_model_loss,
                     reward_preds,
                     td_targets,
                     all_hidden_states,
@@ -807,8 +830,8 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             )
 
         return TdMpc2Output(
-            losses=total_model_loss,
             action_preds=action_pred,
+            losses=total_model_loss,
             reward_preds=reward_preds,
             return_preds=td_targets,
             hidden_states=all_hidden_states,
