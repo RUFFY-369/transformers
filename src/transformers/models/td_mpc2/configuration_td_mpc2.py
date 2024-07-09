@@ -97,7 +97,9 @@ class TdMpc2Config(PretrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
         "hidden_size": "latent_dim",
+        "num_attention_heads": "attention_heads",
         "num_hidden_layers": "num_enc_layers",
+        "vocab_size": "vocab_size",
     }
 
     def __init__(
@@ -143,6 +145,8 @@ class TdMpc2Config(PretrainedConfig):
         obs_shapes= None,
         action_dims= None,
         episode_lengths= None,
+        attention_heads= None, #no attention heads used in architecture
+        vocab_size = None, #no transformers used in architecture
 
         use_cache=True,
         pad_token_id=1,
@@ -191,10 +195,12 @@ class TdMpc2Config(PretrainedConfig):
         self.action_dims= action_dims
         self.episode_lengths= episode_lengths
         self.bin_size= (self.vmax - self.vmin) / (self.num_bins-1)
+        self.attention_heads = attention_heads
+        self.vocab_size = vocab_size
 
         self.use_cache = use_cache
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)

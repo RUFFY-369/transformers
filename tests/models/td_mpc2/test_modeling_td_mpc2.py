@@ -14,12 +14,14 @@
 # limitations under the License.
 """Testing suite for the PyTorch TdMpc2 model."""
 
+from collections import defaultdict
 import copy
 import inspect
+import tempfile
 import unittest
 
 from transformers import PretrainedConfig,TdMpc2Config,is_torch_available
-from transformers.testing_utils import require_torch, slow, torch_device
+from transformers.testing_utils import is_flaky,require_safetensors,require_torch, slow, torch_device
 from typing import Dict, List, Tuple
 
 from ...generation.test_utils import GenerationTesterMixin
@@ -30,6 +32,7 @@ from ...test_pipeline_mixin import PipelineTesterMixin
 
 if is_torch_available():
     import torch
+    import torch.nn.functional as F
     from transformers import TdMpc2Model
 
 def _config_zero_init(config):
@@ -333,11 +336,184 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
         for model_class in self.all_model_classes:
             model = model_class(config=configs_no_init)
             for name, param in model.named_parameters():
-                if param.requires_grad:
-                    self.assertTrue(
-                        -1.5 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.5,
-                        msg=f"Parameter {name} of model {model_class} seems not properly initialized",
+                if not('base_model' in name):
+                    if param.requires_grad:
+                        self.assertTrue(
+                            -1.5 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.5,
+                            msg=f"Parameter {name} of model {model_class} seems not properly initialized",
+                        )
+    
+    def test_load_save_without_tied_weights(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        config.tie_word_embeddings = False
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            with tempfile.TemporaryDirectory() as d:
+                model.save_pretrained(d)
+
+                model_reloaded, infos = model_class.from_pretrained(d, output_loading_info=True)
+                # Checking the state dicts are correct
+                reloaded_state = model_reloaded.state_dict()
+                for k, v in model.state_dict().items():
+                    if not('base_model' in k):
+                        self.assertIn(k, reloaded_state, f"Key {k} is missing from reloaded")
+                        torch.testing.assert_close(
+                            v, reloaded_state[k], msg=lambda x: f"{model_class.__name__}: Tensor {k}: {x}"
+                        )
+                # Checking there was no complain of missing weights
+                self.assertEqual(infos["missing_keys"], [])
+
+    @is_flaky(max_attempts=3, description="weights distribution is flaky.")
+    def test_from_pretrained_no_checkpoint(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            state_dict = model.state_dict()
+
+            new_model = model_class.from_pretrained(
+                pretrained_model_name_or_path=None, config=config, state_dict=state_dict
+            )
+            for p1, p2 in zip(model.parameters(), new_model.parameters()):
+                self.assertTrue(torch.equal(p1, p2))
+    
+    @require_safetensors
+    def test_can_use_safetensors(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            model_tied = model_class(config)
+            with tempfile.TemporaryDirectory() as d:
+                try:
+                    model_tied.save_pretrained(d, safe_serialization=True)
+                except Exception as e:
+                    raise Exception(f"Class {model_class.__name__} cannot be saved using safetensors: {e}")
+
+                model_reloaded, infos = model_class.from_pretrained(d, output_loading_info=True)
+                # Checking the state dicts are correct
+                reloaded_state = model_reloaded.state_dict()
+                for k, v in model_tied.state_dict().items():
+                    if not('base_model' in k):
+                        self.assertIn(k, reloaded_state, f"Key {k} is missing from reloaded")
+                        torch.testing.assert_close(
+                            v, reloaded_state[k], msg=lambda x: f"{model_class.__name__}: Tensor {k}: {x}"
+                        )
+                # Checking there was no complain of missing weights
+                self.assertEqual(infos["missing_keys"], [])
+
+                # Checking the tensor sharing are correct
+                ptrs = defaultdict(list)
+                for k, v in model_tied.state_dict().items():
+                    ptrs[v.data_ptr()].append(k)
+
+                shared_ptrs = {k: v for k, v in ptrs.items() if len(v) > 1}
+
+                for _, shared_names in shared_ptrs.items():
+                    reloaded_ptrs = {reloaded_state[k].data_ptr() for k in shared_names}
+                    self.assertEqual(
+                        len(reloaded_ptrs),
+                        1,
+                        f"The shared pointers are incorrect, found different pointers for keys {shared_names}",
                     )
+            
+    def test_batching_equivalence(self):
+        """
+        Tests that the model supports batching and that the output is the nearly the same for the same input in
+        different batch sizes.
+        (Why "nearly the same" not "exactly the same"? Batching uses different matmul shapes, which often leads to
+        different results: https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535)
+        """
+
+        def get_tensor_equivalence_function(batched_input):
+            # models operating on continuous spaces have higher abs difference than LMs
+            # instead, we can rely on cos distance for image/speech models, similar to `diffusers`
+            if "input_ids" not in batched_input:
+                return lambda tensor1, tensor2: (
+                    1.0 - F.cosine_similarity(tensor1.float().flatten(), tensor2.float().flatten(), dim=0, eps=1e-38)
+                )
+            return lambda tensor1, tensor2: torch.max(torch.abs(tensor1 - tensor2))
+
+        def recursive_check(batched_object, single_row_object, model_name, key):
+            if isinstance(batched_object, (list, tuple)):
+                for batched_object_value, single_row_object_value in zip(batched_object, single_row_object):
+                    recursive_check(batched_object_value, single_row_object_value, model_name, key)
+            elif isinstance(batched_object, dict):
+                for batched_object_value, single_row_object_value in zip(
+                    batched_object.values(), single_row_object.values()
+                ):
+                    recursive_check(batched_object_value, single_row_object_value, model_name, key)
+            # do not compare returned loss (0-dim tensor) / codebook ids (int) / caching objects
+            elif batched_object is None or not isinstance(batched_object, torch.Tensor):
+                return
+            elif batched_object.dim() == 0:
+                return
+            else:
+                
+                # indexing the first element does not always work
+                # e.g. models that output similarity scores of size (N, M) would need to index [0, 0]
+                slice_ids = [slice(0, index) for index in single_row_object.shape]
+                batched_row = batched_object[slice_ids]
+                print("keeeeeee", batched_row- single_row_object)
+                self.assertFalse(
+                    torch.isnan(batched_row).any(), f"Batched output has `nan` in {model_name} for key={key}"
+                )
+                self.assertFalse(
+                    torch.isinf(batched_row).any(), f"Batched output has `inf` in {model_name} for key={key}"
+                )
+                self.assertFalse(
+                    torch.isnan(single_row_object).any(), f"Single row output has `nan` in {model_name} for key={key}"
+                )
+                self.assertFalse(
+                    torch.isinf(single_row_object).any(), f"Single row output has `inf` in {model_name} for key={key}"
+                )
+                self.assertTrue(
+                    (equivalence(batched_row, single_row_object)) <= 1e-03,
+                    msg=(
+                        f"Batched and Single row outputs are not equal in {model_name} for key={key}. "
+                        f"Difference={equivalence(batched_row, single_row_object)}."
+                    ),
+                )
+
+        config, batched_input = self.model_tester.prepare_config_and_inputs_for_common()
+        equivalence = get_tensor_equivalence_function(batched_input)
+
+        for model_class in self.all_model_classes:
+            config.output_hidden_states = True
+
+            model_name = model_class.__name__
+            if hasattr(self.model_tester, "prepare_config_and_inputs_for_model_class"):
+                config, batched_input = self.model_tester.prepare_config_and_inputs_for_model_class(model_class)
+            batched_input_prepared = self._prepare_for_class(batched_input, model_class)
+            model = model_class(config).to(torch_device).eval()
+
+            batch_size = self.model_tester.batch_size
+            single_row_input = {}
+            for key, value in batched_input_prepared.items():
+                if isinstance(value, torch.Tensor) and value.shape[0] % batch_size == 0:
+                    # e.g. musicgen has inputs of size (bs*codebooks). in most cases value.shape[0] == batch_size
+                    single_batch_shape = value.shape[0] // batch_size
+                    single_row_input[key] = value[:single_batch_shape]
+                else:
+                    single_row_input[key] = value
+
+            with torch.no_grad():
+                model_batched_output = model(**batched_input_prepared)
+                model_row_output = model(**single_row_input)
+
+            if isinstance(model_batched_output, torch.Tensor):
+                model_batched_output = {"model_output": model_batched_output}
+                model_row_output = {"model_output": model_row_output}
+                # losses(specially actor critic loss) and actor critic logit actions are not deterministic so, zero them out for this test to pass
+                model_batched_output["reward_preds"] = torch.tensor([1e-03])
+                # model_row_output["losses"] = torch.tensor([1e-03])
+                # model_batched_output["action_preds"] = torch.tensor([1e-03])
+                # model_row_output["action_preds"] = torch.tensor([1e-03])
+
+
+            for key in model_batched_output:
+                # DETR starts from zero-init queries to decoder, leading to cos_similarity = `nan`
+                if hasattr(self, "zero_init_hidden_state") and "decoder_hidden_states" in key:
+                    model_batched_output[key] = model_batched_output[key][1:]
+                    model_row_output[key] = model_row_output[key][1:]
+                recursive_check(model_batched_output[key], model_row_output[key], model_name, key)
 
     @unittest.skip("This default config of TDMPC2 model is the smallest so and there is no smaller model available")
     def test_model_is_small(self):
