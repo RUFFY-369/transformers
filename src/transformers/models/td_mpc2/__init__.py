@@ -27,8 +27,6 @@ except OptionalDependencyNotAvailable:
     pass
 else:
     _import_structure["modeling_td_mpc2"] = [
-        "TdMpc2GPT2Model",
-        "TdMpc2GPT2PreTrainedModel",
         "TdMpc2Model",
         "TdMpc2PreTrainedModel",
     ]
@@ -46,8 +44,6 @@ if TYPE_CHECKING:
         pass
     else:
         from .modeling_td_mpc2 import (
-            TdMpc2GPT2Model,
-            TdMpc2GPT2PreTrainedModel,
             TdMpc2Model,
             TdMpc2PreTrainedModel,
         )

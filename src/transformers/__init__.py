@@ -3270,8 +3270,6 @@ else:
     )
     _import_structure["models.td_mpc2"].extend(
         [
-            "TdMpc2GPT2Model",
-            "TdMpc2GPT2PreTrainedModel",
             "TdMpc2Model",
             "TdMpc2PreTrainedModel",
         ]
@@ -7574,8 +7572,6 @@ if TYPE_CHECKING:
             load_tf_weights_in_tapas,
         )
         from .models.td_mpc2 import (
-            TdMpc2GPT2Model,
-            TdMpc2GPT2PreTrainedModel,
             TdMpc2Model,
             TdMpc2PreTrainedModel,
         )
