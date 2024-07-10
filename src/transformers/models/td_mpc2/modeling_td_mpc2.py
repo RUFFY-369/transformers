@@ -44,33 +44,29 @@ _CONFIG_FOR_DOC = "TdMpc2Config"
 
 
 @dataclass
-# Copied from transformers.models.decision_transformer.modeling_decision_transformer.DecisionTransformerOutput with DecisionTransformer->TdMpc2
 class TdMpc2Output(ModelOutput):
     """
     Base class for model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        state_preds (`torch.FloatTensor` of shape `(batch_size, sequence_length, state_dim)`):
-            Environment state predictions
-        action_preds (`torch.FloatTensor` of shape `(batch_size, sequence_length, action_dim)`):
+        action_preds (`torch.FloatTensor` of shape `(horizon+1, batch_size, action_dim)`):
             Model action predictions
-        return_preds (`torch.FloatTensor` of shape `(batch_size, sequence_length, 1)`):
-            Predicted returns for each state
+        losses (`[torch.FloatTensor]` of shape `(2,)`):
+            Model's total loss[consistency loss, reward loss and value loss] and policy loss.
+        reward_preds (`torch.FloatTensor` of shape `(horizon, batch_size, num_bins)`):
+            Model reward predictions
+        return_preds (`torch.FloatTensor` of shape `(horizon, batch_size, 1)`):
+            Predicted returns or td targets for each state
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
-            shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
+            Tuple of `torch.FloatTensor` (for each layer of MLP of all the functional passes to the components of the Model) of various shapes as there
+            are five components (encoder, latent dynamics, reward, policy,td targets) of the model and the shapes of hidden states are:
+            `(batch_size, enc_dim), (batch_size, latent_dim), (num_q, horizon, batch_size, latent_dim),(num_q,horizon,batch_size, num_bins),(horizon,batch_size,latent_dim),
+            (horizon,batch_size,num_bins),(horizon+1,batch_size,latent_dim),(horizon+1,batch_size,2*action_dim),(num_q, horizon+1, batch_size, latent_dim),
+            (num_q, horizon+1, batch_size, num_bins)`.
+            Hidden-states of the model at the output of each layer.
+        attentions (`None`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            The model doesn't have attention heads so its value is None always until any changes are done in the architecture
     """
-
     action_preds: torch.FloatTensor = None
     losses: torch.FloatTensor = None
     reward_preds: torch.FloatTensor = None
@@ -79,7 +75,6 @@ class TdMpc2Output(ModelOutput):
     attentions: torch.FloatTensor = None
 
 
-# Copied from transformers.models.decision_transformer.modeling_decision_transformer.DecisionTransformerPreTrainedModel with DecisionTransformer->TdMpc2,decision_transformer->td_mpc2
 class TdMpc2PreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
@@ -114,7 +109,7 @@ class TdMpc2PreTrainedModel(PreTrainedModel):
                 p.data.fill_(0)
 
 
-DECISION_TRANSFORMER_START_DOCSTRING = r"""
+TD_MPC2_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) sub-class. Use
     it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage and
     behavior.
@@ -125,26 +120,27 @@ DECISION_TRANSFORMER_START_DOCSTRING = r"""
             configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-DECISION_TRANSFORMER_INPUTS_DOCSTRING = r"""
+TD_MPC2_INPUTS_DOCSTRING = r"""
     Args:
-        states (`torch.FloatTensor` of shape `(batch_size, episode_length, state_dim)`):
-            The states for each step in the trajectory
-        actions (`torch.FloatTensor` of shape `(batch_size, episode_length, act_dim)`):
-            The actions taken by the "expert" policy for the current state, these are masked for auto regressive
-            prediction
-        rewards (`torch.FloatTensor` of shape `(batch_size, episode_length, 1)`):
-            The rewards for each state, action
-        returns_to_go (`torch.FloatTensor` of shape `(batch_size, episode_length, 1)`):
-            The returns for each state in the trajectory
-        timesteps (`torch.LongTensor` of shape `(batch_size, episode_length)`):
-            The timestep for each step in the trajectory
-        attention_mask (`torch.FloatTensor` of shape `(batch_size, episode_length)`):
-            Masking, used to mask the actions when performing autoregressive prediction
+        observations (`torch.FloatTensor` of shape `(horizon+1, batch_size, state_dim)`):
+            The observations from real environment(s) for single or multi task training upto horizon+1 length
+        actions (`torch.FloatTensor` of shape `(horizon, batch_size, action_dim)`):
+            The actions from real environment for single or multi task training upto horizon length
+        rewards (`torch.FloatTensor` of shape `(horizon, batch_size, 1`):
+            The rewards from real environment for single or multi task training upto horizon length
+        tasks (`None`/'torch.IntTensor of shape `None`/`(task_dim)`):
+            The task embeddings for multitask model training
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail.(This model doesn't have attention heads so it's always None)
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 """
 
-
 # Math operations.
-
 
 def soft_ce(pred, target, cfg):
     """Computes the cross entropy loss between predictions and soft targets."""
@@ -548,7 +544,7 @@ class TdMpc2WorldModel(nn.Module):
             emb = emb.repeat(x.shape[0], 1)
         return torch.cat([x, emb], dim=-1)
 
-    def encode(self, observations, tasks, output_hidden_states: bool = False):  ############HS##############
+    def encode(self, observations, tasks, output_hidden_states: bool = False):
         """
         Encodes an observation into its latent representation.
         This implementation assumes a single state-based observation.
@@ -568,7 +564,7 @@ class TdMpc2WorldModel(nn.Module):
                 hidden_state.requires_grad_(True)
         return encoded_out[0], encoded_out[1]
 
-    def next(self, z, a, tasks, output_hidden_states: bool = False):  #########HS#######
+    def next(self, z, a, tasks, output_hidden_states: bool = False):
         """
         Predicts the next latent state given the current latent state and action.
         """
@@ -577,7 +573,7 @@ class TdMpc2WorldModel(nn.Module):
         z = torch.cat([z, a], dim=-1)
         return self._dynamics(z, output_hidden_states)
 
-    def reward(self, z, a, tasks, output_hidden_states: bool = False):  ##############hs###########
+    def reward(self, z, a, tasks, output_hidden_states: bool = False):
         """
         Predicts instantaneous (single-step) reward.
         """
@@ -586,7 +582,7 @@ class TdMpc2WorldModel(nn.Module):
         z = torch.cat([z, a], dim=-1)
         return self._reward(z, output_hidden_states)
 
-    def pi(self, z, tasks, output_hidden_states: bool = False):  #################HS################3
+    def pi(self, z, tasks, output_hidden_states: bool = False):
         """
         Samples an action from the policy prior.
         The policy prior is a Gaussian distribution with
@@ -620,7 +616,7 @@ class TdMpc2WorldModel(nn.Module):
 
     def Q(
         self, z, a, tasks, return_type="min", target=False, output_hidden_states: bool = False
-    ):  ################HS###########
+    ):
         """
         Predict state-action value.
         `return_type` can be one of [`min`, `avg`, `all`]:
@@ -670,7 +666,7 @@ class TdMpc2Losses:
         return total_loss
 
 
-@add_start_docstrings("The TD-MPC2 Model", DECISION_TRANSFORMER_START_DOCSTRING)
+@add_start_docstrings("The TD-MPC2 Model", TD_MPC2_START_DOCSTRING)
 class TdMpc2Model(TdMpc2PreTrainedModel):
     """
 
@@ -765,7 +761,7 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
 
         return pi_loss, action_pred, hidden_states_pi, hidden_states_upd_pi_Q
 
-    @add_start_docstrings_to_model_forward(DECISION_TRANSFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_start_docstrings_to_model_forward(TD_MPC2_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=TdMpc2Output, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -821,9 +817,6 @@ class TdMpc2Model(TdMpc2PreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # SHAPE BUFFER: torch.Size([4, 256, 223])(observations) torch.Size([3, 256, 38])(action) torch.Size([3, 256, 1])(reward) None(task):
-        # # timesteps-1,batch_size,observation_dim_dog_run, timesteps-1,batch_size,action_dim_dog_run, timesteps-1,batch_size
 
         with torch.no_grad():
             next_z, _ = self.world_model.encode(observations[1:], tasks, output_hidden_states)

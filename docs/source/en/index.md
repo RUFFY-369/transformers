@@ -294,6 +294,7 @@ Flax), PyTorch, and/or TensorFlow.
 |             [Table Transformer](model_doc/table-transformer)             |       ✅        |         ❌         |      ❌      |
 |                         [TAPAS](model_doc/tapas)                         |       ✅        |         ✅         |      ❌      |
 |                         [TAPEX](model_doc/tapex)                         |       ✅        |         ✅         |      ✅      |
+|                         [TD-MPC2](model_doc/td_mpc2)                     |       ✅        |         ❌         |      ❌      |
 |       [Time Series Transformer](model_doc/time_series_transformer)       |       ✅        |         ❌         |      ❌      |
 |                   [TimeSformer](model_doc/timesformer)                   |       ✅        |         ❌         |      ❌      |
 |        [Trajectory Transformer](model_doc/trajectory_transformer)        |       ✅        |         ❌         |      ❌      |

@@ -18,30 +18,22 @@ rendered properly in your Markdown viewer.
 
 ## Overview
 
-The TD-MPC2 model was proposed in [<INSERT PAPER NAME HERE>](<INSERT PAPER LINK HERE>) by <INSERT AUTHORS HERE>.
-<INSERT SHORT SUMMARY HERE>
+The TD-MPC2 model was proposed in [TD-MPC2:Scalable, Robust World Models for Continuous Control](https://arxiv.org/abs/2310.16828) by Nicklas Hansen, Hao Su, Xiaolong Wang.
 
 The abstract from the paper is the following:
 
-*<INSERT PAPER ABSTRACT HERE>*
+*TD-MPC is a model-based reinforcement learning (RL) algorithm that performs local trajectory optimization in the latent space of a learned implicit (decoderfree) world model. In this work, we present TD-MPC2: a series of improvements upon the TD-MPC algorithm. We demonstrate that TD-MPC2 improves significantly over baselines across 104 online RL tasks spanning 4 diverse task domains, achieving consistently strong results with a single set of hyperparameters. We further show that agent capabilities increase with model and data size, and successfully train a single 317M parameter agent to perform 80 tasks across multiple task domains, embodiments, and action spaces. We conclude with an account of lessons, opportunities, and risks associated with large TD-MPC2 agents.*
 
 Tips:
 
-<INSERT TIPS ABOUT MODEL HERE>
+The hugging face version of the model provides the architecture of the original model for training and inference with the exact same output of precision more than 1e-3. The batch provided for training and inference is same as given in the original model, i.e., [observations,actions,rewards,tasks/task embeddings]. It depends on you if you want to use the same method of data collection from env as provided in the original code or use or your own as the this version supports both. The model is multitask model for performing various tasks of different domains,action spaces or can be used as single task model for just one env. If you want to use it, provide the batch consisting of [observations(state space provided from env),actions,rewards,tasks/task embeddings](from the env).
 
-This model was contributed by [INSERT YOUR HF USERNAME HERE](https://huggingface.co/<INSERT YOUR HF USERNAME HERE>).
-The original code can be found [here](<INSERT LINK TO GITHUB REPO HERE>).
+This model was contributed by [ruffy369](https://huggingface.co/ruffy369). The original code can be found [here](https://github.com/nicklashansen tdmpc2).
 
 
 ## TdMpc2Config
 
 [[autodoc]] TdMpc2Config
-
-
-## TdMpc2GPT2Model
-
-[[autodoc]] TdMpc2GPT2Model
-    - forward
 
 ## TdMpc2Model
 
