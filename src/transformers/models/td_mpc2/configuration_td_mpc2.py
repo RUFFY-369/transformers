@@ -112,7 +112,7 @@ class TdMpc2Config(PretrainedConfig):
         episode_lengths (`List[int]`, defaults to `None`):
             The list of maximum number of episode steps for all environments for multitask training/evaluation.
         use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models and 
+            Whether or not the model should return the last key/values attentions (not used by all models and
             isn't used by this model as there are no attention heads).
         pad_token_id (`int`, *optional*, defaults to 1):
             Padding token id.
@@ -170,7 +170,7 @@ class TdMpc2Config(PretrainedConfig):
         num_bins=101,
         vmin=-10,
         vmax=+10,
-        model_size= 1,
+        model_size=1,
         num_enc_layers=2,
         enc_dim=256,
         num_channels=32,

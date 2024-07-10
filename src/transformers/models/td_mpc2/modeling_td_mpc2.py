@@ -67,6 +67,7 @@ class TdMpc2Output(ModelOutput):
         attentions (`None`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
             The model doesn't have attention heads so its value is None always until any changes are done in the architecture
     """
+
     action_preds: torch.FloatTensor = None
     losses: torch.FloatTensor = None
     reward_preds: torch.FloatTensor = None
@@ -141,6 +142,7 @@ TD_MPC2_INPUTS_DOCSTRING = r"""
 """
 
 # Math operations.
+
 
 def soft_ce(pred, target, cfg):
     """Computes the cross entropy loss between predictions and soft targets."""
@@ -614,9 +616,7 @@ class TdMpc2WorldModel(nn.Module):
 
         return mu, pi, log_pi, log_strd, hidden_states_pi
 
-    def Q(
-        self, z, a, tasks, return_type="min", target=False, output_hidden_states: bool = False
-    ):
+    def Q(self, z, a, tasks, return_type="min", target=False, output_hidden_states: bool = False):
         """
         Predict state-action value.
         `return_type` can be one of [`min`, `avg`, `all`]:
