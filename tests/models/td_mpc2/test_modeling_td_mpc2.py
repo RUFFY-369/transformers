@@ -14,15 +14,15 @@
 # limitations under the License.
 """Testing suite for the PyTorch TdMpc2 model."""
 
-from collections import defaultdict
 import copy
 import inspect
 import tempfile
 import unittest
-
-from transformers import PretrainedConfig,TdMpc2Config,is_torch_available
-from transformers.testing_utils import is_flaky,require_safetensors,require_torch, slow, torch_device
+from collections import defaultdict
 from typing import Dict, List, Tuple
+
+from transformers import PretrainedConfig, TdMpc2Config, is_torch_available
+from transformers.testing_utils import is_flaky, require_safetensors, require_torch, slow, torch_device
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
@@ -33,7 +33,9 @@ from ...test_pipeline_mixin import PipelineTesterMixin
 if is_torch_available():
     import torch
     import torch.nn.functional as F
+
     from transformers import TdMpc2Model
+
 
 def _config_zero_init(config):
     configs_no_init = copy.deepcopy(config)
@@ -54,7 +56,7 @@ class TdMpc2ModelTester:
         horizon=3,
         act_dim=38,
         state_dim=223,
-        tasks=None, #For single task its None unless multitasking training is done
+        tasks=None,  # For single task its None unless multitasking training is done
         # hidden_size=23,
         # max_length=11,
         is_training=True,
@@ -72,10 +74,12 @@ class TdMpc2ModelTester:
     def prepare_config_and_inputs(self):
         config = self.get_config()
         # Generate a random float between the range from -1216.0 to 2040.0
-        states =  (floats_tensor((self.horizon+1,self.batch_size, self.state_dim)) * 3256.0) - 1216.0 #(states*(2040.0 + 1216.0))-1216.0
-        #Generate a random float between the range from -1.0 to 1.0
-        actions = (floats_tensor((self.horizon,self.batch_size, self.act_dim)) * 2.0) - 1.0
-        rewards = floats_tensor((self.horizon,self.batch_size, 1))
+        states = (
+            floats_tensor((self.horizon + 1, self.batch_size, self.state_dim)) * 3256.0
+        ) - 1216.0  # (states*(2040.0 + 1216.0))-1216.0
+        # Generate a random float between the range from -1.0 to 1.0
+        actions = (floats_tensor((self.horizon, self.batch_size, self.act_dim)) * 2.0) - 1.0
+        rewards = floats_tensor((self.horizon, self.batch_size, 1))
         tasks = self.tasks
 
         return (
@@ -105,12 +109,14 @@ class TdMpc2ModelTester:
         model.eval()
         result = model(states, actions, rewards, tasks)
 
-        action_pred_expected_shape = torch.Size((actions.shape[0]+1,actions.shape[1],actions.shape[2])) # first index:horizon+1
-        reward_pred_expected_shape = torch.Size((rewards.shape[0],rewards.shape[1],config.num_bins))
-        
+        action_pred_expected_shape = torch.Size(
+            (actions.shape[0] + 1, actions.shape[1], actions.shape[2])
+        )  # first index:horizon+1
+        reward_pred_expected_shape = torch.Size((rewards.shape[0], rewards.shape[1], config.num_bins))
+
         self.parent.assertEqual(result.action_preds.shape, action_pred_expected_shape)
         self.parent.assertEqual(result.reward_preds.shape, reward_pred_expected_shape)
-        #td targets
+        # td targets
         self.parent.assertEqual(result.return_preds.shape, rewards.shape)
 
     def prepare_config_and_inputs_for_common(self):
@@ -244,7 +250,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
 
             if self.has_attentions:
                 self.assertIsNotNone(attentions.grad)
-    
+
     def test_model_outputs_equivalence(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
@@ -256,7 +262,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
             with torch.no_grad():
                 tuple_output = model(**tuple_inputs, return_dict=False, **additional_kwargs)
                 dict_output = model(**dict_inputs, return_dict=True, **additional_kwargs).to_tuple()
-                
+
                 tuple_dummy = ()
                 dict_dummy = ()
                 # losses(specially policy loss) and td targets are not deterministic so, squeeze them out for the test
@@ -266,7 +272,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
                     dict_dummy = dict_dummy + (output,) if i not in [1, 3] else dict_dummy
                 tuple_output = tuple_dummy
                 dict_output = dict_dummy
-                
+
                 def recursive_check(tuple_object, dict_object):
                     if isinstance(tuple_object, (List, Tuple)):
                         for tuple_iterable_value, dict_iterable_value in zip(tuple_object, dict_object):
@@ -328,7 +334,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
                 check_equivalence(
                     model, tuple_inputs, dict_inputs, {"output_hidden_states": True, "output_attentions": True}
                 )
-    
+
     def test_initialization(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
 
@@ -336,13 +342,13 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
         for model_class in self.all_model_classes:
             model = model_class(config=configs_no_init)
             for name, param in model.named_parameters():
-                if not('base_model' in name):
+                if "base_model" not in name:
                     if param.requires_grad:
                         self.assertTrue(
                             -1.5 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.5,
                             msg=f"Parameter {name} of model {model_class} seems not properly initialized",
                         )
-    
+
     def test_load_save_without_tied_weights(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
         config.tie_word_embeddings = False
@@ -355,7 +361,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
                 # Checking the state dicts are correct
                 reloaded_state = model_reloaded.state_dict()
                 for k, v in model.state_dict().items():
-                    if not('base_model' in k):
+                    if "base_model" not in k:
                         self.assertIn(k, reloaded_state, f"Key {k} is missing from reloaded")
                         torch.testing.assert_close(
                             v, reloaded_state[k], msg=lambda x: f"{model_class.__name__}: Tensor {k}: {x}"
@@ -375,7 +381,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
             )
             for p1, p2 in zip(model.parameters(), new_model.parameters()):
                 self.assertTrue(torch.equal(p1, p2))
-    
+
     @require_safetensors
     def test_can_use_safetensors(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
@@ -391,7 +397,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
                 # Checking the state dicts are correct
                 reloaded_state = model_reloaded.state_dict()
                 for k, v in model_tied.state_dict().items():
-                    if not('base_model' in k):
+                    if "base_model" not in k:
                         self.assertIn(k, reloaded_state, f"Key {k} is missing from reloaded")
                         torch.testing.assert_close(
                             v, reloaded_state[k], msg=lambda x: f"{model_class.__name__}: Tensor {k}: {x}"
@@ -413,7 +419,7 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
                         1,
                         f"The shared pointers are incorrect, found different pointers for keys {shared_names}",
                     )
-            
+
     def test_batching_equivalence(self):
         """
         Tests that the model supports batching and that the output is the nearly the same for the same input in
@@ -495,20 +501,21 @@ class TdMpc2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
             with torch.no_grad():
                 model_batched_output = model(**batched_input_prepared)
                 model_row_output = model(**single_row_input)
-                # reward predictions original outputs were 0.0 but using cosine similarity gives output as 0.0 so making it close to zero for 
+                # reward predictions original outputs were 0.0 but using cosine similarity gives output as 0.0 so making it close to zero for
                 # proper output in from lambda function. return predictions or td targets and hidden states are not deterministic so,
                 # almost zero them out for this test to pass
-                model_batched_output["reward_preds"] = torch.ones_like(model_batched_output["reward_preds"])*1e-05
-                model_row_output["reward_preds"] = torch.ones_like(model_row_output["reward_preds"])*1e-05
-                model_batched_output["return_preds"] = torch.ones_like(model_batched_output["return_preds"])*1e-05
-                model_row_output["return_preds"] = torch.ones_like(model_row_output["return_preds"])*1e-05
-                model_batched_output["hidden_states"] = torch.ones_like(model_batched_output["hidden_states"][0])*1e-05
-                model_row_output["hidden_states"] = torch.ones_like(model_row_output["hidden_states"][0])*1e-05
+                model_batched_output["reward_preds"] = torch.ones_like(model_batched_output["reward_preds"]) * 1e-05
+                model_row_output["reward_preds"] = torch.ones_like(model_row_output["reward_preds"]) * 1e-05
+                model_batched_output["return_preds"] = torch.ones_like(model_batched_output["return_preds"]) * 1e-05
+                model_row_output["return_preds"] = torch.ones_like(model_row_output["return_preds"]) * 1e-05
+                model_batched_output["hidden_states"] = (
+                    torch.ones_like(model_batched_output["hidden_states"][0]) * 1e-05
+                )
+                model_row_output["hidden_states"] = torch.ones_like(model_row_output["hidden_states"][0]) * 1e-05
 
             if isinstance(model_batched_output, torch.Tensor):
                 model_batched_output = {"model_output": model_batched_output}
                 model_row_output = {"model_output": model_row_output}
-                
 
             for key in model_batched_output:
                 # DETR starts from zero-init queries to decoder, leading to cos_similarity = `nan`
@@ -532,7 +539,7 @@ class TdMpc2ModelIntegrationTest(unittest.TestCase):
     def test_autoregressive_prediction(self):
         """
         An integration test that performs predicts outcomes (returns) conditioned on a sequence of actions, joint-embedding prediction
-        (for multitask dataset,this test use single task), rewards, and TD-learning without decoding observations from a sequence of 
+        (for multitask dataset,this test use single task), rewards, and TD-learning without decoding observations from a sequence of
         observations,actions,rewards and task embeddings. Test is performed over two timesteps.
         """
 
@@ -545,49 +552,198 @@ class TdMpc2ModelIntegrationTest(unittest.TestCase):
         config = model.config
         torch.manual_seed(0)
 
-        expected_outputs = [torch.tensor([[[-0.1697,  1.0000,  1.0000, -1.0000, -1.0000,  1.0000,  1.0000,
-           0.9997, -1.0000, -1.0000, -1.0000, -1.0000,  0.9961, -1.0000,
-          -1.0000,  1.0000,  0.9993,  1.0000, -1.0000,  1.0000,  0.8602,
-          -1.0000,  0.9507,  1.0000, -1.0000, -1.0000, -1.0000, -0.9929,
-          -1.0000,  1.0000,  0.9981, -0.9983,  0.9999, -1.0000, -1.0000,
-           1.0000,  1.0000, -0.9931]],
+        expected_outputs = [
+            torch.tensor(
+                [
+                    [
+                        [
+                            -0.1697,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            0.9997,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            0.9961,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            0.9993,
+                            1.0000,
+                            -1.0000,
+                            1.0000,
+                            0.8602,
+                            -1.0000,
+                            0.9507,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -0.9929,
+                            -1.0000,
+                            1.0000,
+                            0.9981,
+                            -0.9983,
+                            0.9999,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            -0.9931,
+                        ]
+                    ],
+                    [
+                        [
+                            0.9524,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            -0.9750,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            0.9825,
+                            -0.9546,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -0.9816,
+                            1.0000,
+                            -0.6706,
+                            -0.2327,
+                            1.0000,
+                            1.0000,
+                            0.6740,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            0.9998,
+                            0.3885,
+                            -1.0000,
+                            1.0000,
+                            0.9999,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                        ]
+                    ],
+                    [
+                        [
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            -0.9891,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -0.9528,
+                            1.0000,
+                            -0.8844,
+                            -0.9878,
+                            1.0000,
+                            1.0000,
+                            0.6049,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            0.9999,
+                            -1.0000,
+                            1.0000,
+                            0.9990,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                        ]
+                    ],
+                    [
+                        [
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -1.0000,
+                            -0.9328,
+                            -1.0000,
+                            -0.9997,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -0.9999,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            -0.9986,
+                            -1.0000,
+                            -0.9976,
+                            -1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            1.0000,
+                            -1.0000,
+                        ]
+                    ],
+                ],
+                device=torch_device,
+            )
+        ]
 
-        [[ 0.9524,  1.0000, -1.0000, -1.0000, -1.0000,  1.0000, -0.9750,
-           1.0000, -1.0000, -1.0000, -1.0000,  0.9825, -0.9546, -1.0000,
-          -1.0000,  1.0000,  1.0000,  1.0000, -0.9816,  1.0000, -0.6706,
-          -0.2327,  1.0000,  1.0000,  0.6740, -1.0000, -1.0000, -1.0000,
-          -1.0000,  0.9998,  0.3885, -1.0000,  1.0000,  0.9999,  1.0000,
-           1.0000,  1.0000, -1.0000]],
-
-        [[-1.0000,  1.0000, -1.0000, -1.0000, -1.0000,  1.0000, -1.0000,
-           1.0000, -1.0000, -1.0000, -1.0000,  1.0000, -0.9891, -1.0000,
-          -1.0000,  1.0000,  1.0000,  1.0000, -0.9528,  1.0000, -0.8844,
-          -0.9878,  1.0000,  1.0000,  0.6049, -1.0000, -1.0000, -1.0000,
-          -1.0000,  1.0000,  0.9999, -1.0000,  1.0000,  0.9990,  1.0000,
-           1.0000,  1.0000, -1.0000]],
-
-        [[-1.0000,  1.0000, -1.0000, -1.0000, -1.0000,  1.0000, -1.0000,
-           1.0000, -1.0000, -1.0000, -1.0000, -0.9328, -1.0000, -0.9997,
-          -1.0000,  1.0000,  1.0000,  1.0000, -0.9999,  1.0000,  1.0000,
-          -1.0000,  1.0000,  1.0000, -0.9986, -1.0000, -0.9976, -1.0000,
-          -1.0000,  1.0000,  1.0000, -1.0000,  1.0000,  1.0000,  1.0000,
-           1.0000,  1.0000, -1.0000]]], device=torch_device)]
-        
-
-        states =  (torch.rand((config.horizon+1,config.batch_size, config.obs_shape['state'][0])) * 3256.0) - 1216.0 #(states*(2040.0 + 1216.0))-1216.0
-        actions = (torch.rand((config.horizon,config.batch_size,config.action_dim)) * 2.0) - 1.0
-        rewards = torch.rand((config.horizon,config.batch_size, 1))
+        states = (
+            torch.rand((config.horizon + 1, config.batch_size, config.obs_shape["state"][0])) * 3256.0
+        ) - 1216.0  # (states*(2040.0 + 1216.0))-1216.0
+        actions = (torch.rand((config.horizon, config.batch_size, config.action_dim)) * 2.0) - 1.0
+        rewards = torch.rand((config.horizon, config.batch_size, 1))
         task = None
-        
+
         for step in range(NUM_STEPS):
             with torch.no_grad():
                 model_pred = model(
                     observations=states,
                     actions=actions,
                     rewards=rewards,
-                    tasks = task,
+                    tasks=task,
                     return_dict=True,
                 )
-            actions_expected_shape = torch.Size((actions.shape[0]+1, actions.shape[1],actions.shape[2]))
+            actions_expected_shape = torch.Size((actions.shape[0] + 1, actions.shape[1], actions.shape[2]))
             self.assertEqual(model_pred.action_preds.shape, actions_expected_shape)
             self.assertTrue(torch.allclose(model_pred.action_preds, expected_outputs[step], atol=1e-4))
